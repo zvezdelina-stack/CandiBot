@@ -1,0 +1,15 @@
+{
+  "name": "candibot",
+  "version": "0.1.0",
+  "description": "Slack bot for searching Metaview candidate database",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.19.0",
+    "dotenv": "^16.4.5"
+  }
+}
