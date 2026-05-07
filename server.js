@@ -80,7 +80,10 @@ Your job:
 
 2. Use the search_conversations Metaview tool to fetch candidates from report ID "${REPORT_ID}" with:
    - fields: ${JSON.stringify(FIELD_IDS)}
-   - filters: [{"field_id": "AI:b04c164c-49be-11f1-9b23-674021cd80ae", "operation": "is_one_of", "value": <your chosen function list>}]
+   - filters: [
+       {"field_id": "AI:b04c164c-49be-11f1-9b23-674021cd80ae", "operation": "is_one_of", "value": <your chosen function list>},
+       {"field_id": "default:start_time", "operation": "after", "value": {"scope": "relative", "value": -63072000}}
+     ]
    - limit: 50
    - offset: 0
 
