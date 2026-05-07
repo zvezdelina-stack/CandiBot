@@ -3,6 +3,7 @@ const path = require('path');
 const https = require('https');
 const express = require('express');
 const { App, ExpressReceiver } = require('@slack/bolt');
+const Anthropic = require('@anthropic-ai/sdk');
 
 // ── Env ───────────────────────────────────────────────────────────────────────
 const PORT                 = process.env.PORT || 3000;
@@ -10,6 +11,9 @@ const ANTHROPIC_API_KEY    = process.env.ANTHROPIC_API_KEY;
 const SLACK_BOT_TOKEN      = process.env.SLACK_BOT_TOKEN;
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 const METAVIEW_API_KEY     = process.env.METAVIEW_API_KEY;
+
+// ── Anthropic client ──────────────────────────────────────────────────────────
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const REPORT_ID = '61729db2-3946-11f1-b952-fb44be0b5cdb';
@@ -34,8 +38,8 @@ const FIELD_IDS = [
   'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de',
 ];
 
-// ── HTTP helper ───────────────────────────────────────────────────────────────
-function postJson(hostname, urlPath, headers, body) {
+// ── HTTP helper (used only for Chrome extension proxy) ────────────────────────
+function postJsonRaw(hostname, urlPath, headers, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = https.request(
@@ -63,7 +67,7 @@ function postJson(hostname, urlPath, headers, body) {
   });
 }
 
-// ── Core: multi-turn Claude+MCP agentic loop ──────────────────────────────────
+// ── Core: fetch + rank via Anthropic SDK with MCP ─────────────────────────────
 async function fetchAndRankCandidates(jd) {
   const systemPrompt = `You are an expert executive recruiter at SwingSearch, a retained search firm for venture-backed tech startups.
 
@@ -97,16 +101,6 @@ Scoring rubric:
 
 Be precise and opinionated. Do not hedge.`;
 
-  const tools = [
-    {
-      type: 'mcp',
-      server_label: 'metaview',
-      server_url: 'https://mcp.metaview.ai/mcp',
-      headers: { Authorization: `Bearer ${METAVIEW_API_KEY}` },
-      allowed_tools: ['search_conversations'],
-    },
-  ];
-
   const messages = [
     {
       role: 'user',
@@ -114,70 +108,72 @@ Be precise and opinionated. Do not hedge.`;
     },
   ];
 
-  // Agentic loop — keep going until stop_reason is end_turn or we hit max iterations
+  const mcpServers = [
+    {
+      type: 'url',
+      url: 'https://mcp.metaview.ai/mcp',
+      name: 'metaview',
+      authorization_token: METAVIEW_API_KEY,
+    },
+  ];
+
+  // Agentic loop
   const MAX_ITERATIONS = 20;
   let iterations = 0;
 
   while (iterations < MAX_ITERATIONS) {
     iterations++;
-    console.log(`Agentic loop iteration ${iterations}, messages: ${messages.length}`);
+    console.log(`Agentic iteration ${iterations}, messages: ${messages.length}`);
 
-    const response = await postJson(
-      'api.anthropic.com',
-      '/v1/messages',
-      {
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': 'mcp-client-2025-04-04',
-      },
+    const response = await anthropic.beta.messages.create(
       {
         model: 'claude-sonnet-4-20250514',
         max_tokens: 8192,
         system: systemPrompt,
-        tools,
+        mcp_servers: mcpServers,
         messages,
+      },
+      {
+        headers: { 'anthropic-beta': 'mcp-client-2025-04-04' },
       }
     );
 
     console.log(`stop_reason: ${response.stop_reason}`);
     console.log(`content types: ${response.content?.map((b) => b.type).join(', ')}`);
 
-    if (response.error) {
-      throw new Error(`Anthropic API error: ${JSON.stringify(response.error)}`);
-    }
-
-    // Append assistant turn to message history
+    // Append assistant turn
     messages.push({ role: 'assistant', content: response.content });
 
-    // If end_turn, extract final text and return
     if (response.stop_reason === 'end_turn') {
       const textBlocks = response.content?.filter((b) => b.type === 'text') ?? [];
       const text = textBlocks[textBlocks.length - 1]?.text ?? '';
-      console.log(`Final text preview: ${text.slice(0, 200)}`);
+      console.log(`Final text preview: ${text.slice(0, 300)}`);
       const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
       if (!match) throw new Error(`No JSON in Claude response. Raw: ${text.slice(0, 400)}`);
       return JSON.parse(match[0]);
     }
 
-    // If tool_use, collect all tool use blocks and build tool results
     if (response.stop_reason === 'tool_use') {
-      const toolUseBlocks = response.content?.filter((b) => b.type === 'tool_use') ?? [];
+      // MCP tool results come back automatically on next turn via the SDK
+      // Build the user turn with tool results for any mcp_tool_use blocks
       const mcpToolUseBlocks = response.content?.filter((b) => b.type === 'mcp_tool_use') ?? [];
+      const regularToolUseBlocks = response.content?.filter((b) => b.type === 'tool_use') ?? [];
 
-      console.log(`tool_use blocks: ${toolUseBlocks.length}, mcp_tool_use blocks: ${mcpToolUseBlocks.length}`);
+      console.log(`mcp_tool_use: ${mcpToolUseBlocks.length}, tool_use: ${regularToolUseBlocks.length}`);
 
-      // MCP tool results are handled automatically by the API in mcp-client mode —
-      // we just need to re-submit the conversation with the assistant turn included.
-      // The API appends mcp_tool_result blocks itself on the next turn.
-      // So we just continue the loop — no manual tool result needed.
-      continue;
+      // For mcp_tool_use the SDK handles results internally — just continue
+      if (mcpToolUseBlocks.length > 0 && regularToolUseBlocks.length === 0) {
+        continue;
+      }
+
+      // Fallback: if regular tool_use blocks exist, we can't handle them here
+      throw new Error(`Unexpected regular tool_use blocks in response.`);
     }
 
-    // Any other stop reason — bail
-    throw new Error(`Unexpected stop_reason: ${response.stop_reason}. Content: ${JSON.stringify(response.content?.slice(0, 2))}`);
+    throw new Error(`Unexpected stop_reason: ${response.stop_reason}`);
   }
 
-  throw new Error(`Agentic loop exceeded ${MAX_ITERATIONS} iterations without completing.`);
+  throw new Error(`Loop exceeded ${MAX_ITERATIONS} iterations.`);
 }
 
 // ── Format results for Slack ──────────────────────────────────────────────────
@@ -227,7 +223,6 @@ const receiver = new ExpressReceiver({
 
 const slackApp = new App({ token: SLACK_BOT_TOKEN, receiver });
 
-// Slash command — open modal
 slackApp.command('/rank-candidates', async ({ ack, body, client }) => {
   await ack();
   await client.views.open({
@@ -257,7 +252,6 @@ slackApp.command('/rank-candidates', async ({ ack, body, client }) => {
   });
 });
 
-// Modal submission — run ranking
 slackApp.view('rank_candidates_modal', async ({ ack, body, view, client }) => {
   await ack();
 
