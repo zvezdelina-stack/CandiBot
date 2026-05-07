@@ -29,23 +29,16 @@ const redis = new Redis({
 const REPORT_ID = '61729db2-3946-11f1-b952-fb44be0b5cdb';
 const RANKING_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const FIELD_IDS = [
-  'default:candidate', 'default:start_time', 'default:interviewer',
-  'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e',
-  'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d',
-  'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e',
-  'AI:a9150424-49be-11f1-8e19-179706228ab0',
-  'AI:b04c164c-49be-11f1-9b23-674021cd80ae',
-  'AI:b76395ae-49be-11f1-b7cc-27718543b130',
-  'AI:c3997064-49be-11f1-88cd-e34aef2bf193',
-  'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46',
-  'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042',
-  'AI:e07de6f6-49be-11f1-a6c6-2f3b4b019285',
-  'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9',
-  'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915',
-  'AI:ffcd1fa4-49be-11f1-a302-239193bb599f',
-  'AI:07343c46-49bf-11f1-ac1a-dbf22856edfb',
-  'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2',
-  'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de',
+  'default:candidate',                        // Candidate name
+  'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e', // Candidate Function & Level
+  'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46', // Seniority Level
+  'AI:c3997064-49be-11f1-88cd-e34aef2bf193', // Player/Coach Profile
+  'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d', // Leadership Scope
+  'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e', // Go-to-Market Experience
+  'AI:a9150424-49be-11f1-8e19-179706228ab0', // Company Stage Experience
+  'AI:ffcd1fa4-49be-11f1-a302-239193bb599f', // Industry & Vertical Background
+  'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9', // Deal Size Experience
+  'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915', // Technical Fluency & AI Comfort
 ];
 
 // ── HTTP helper (Chrome extension proxy) ─────────────────────────────────────
@@ -87,7 +80,7 @@ Your job:
    - limit: 50
    - offset: 0
 
-3. CRITICAL - YOU MUST PAGINATE. After each response check the has_more field. If has_more is true, call search_conversations again with offset incremented by 50. Keep going until has_more is explicitly false. Do not stop early. Do not rank until you have fetched ALL pages.
+3. CRITICAL - YOU MUST PAGINATE. After each response check the has_more field. If has_more is true, wait 2 seconds then call search_conversations again with offset incremented by 50. Keep going until has_more is explicitly false. Do not stop early. Do not rank until you have fetched ALL pages.
 
 4. Once all pages are fetched, rank every candidate by fit against the job description or scorecard.
 
@@ -159,6 +152,8 @@ Scoring: 80-100 Strong Fit, 50-79 Possible Fit, 0-49 Not a Fit. Be precise and o
     if (stopReason === 'tool_use') {
       const regularBlocks = responseContent.filter(b => b.type === 'tool_use');
       if (regularBlocks.length > 0) throw new Error('Unexpected regular tool_use blocks.');
+      // Wait 2 seconds between pages to stay under rate limits
+      await new Promise(resolve => setTimeout(resolve, 2000));
       continue;
     }
 
