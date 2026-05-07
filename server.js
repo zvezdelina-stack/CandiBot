@@ -128,7 +128,7 @@ Be precise and opinionated. Do not hedge.`;
     const response = await anthropic.beta.messages.create(
       {
         model: 'claude-sonnet-4-6',
-        max_tokens: 8192,
+        max_tokens: 32000,
         system: systemPrompt,
         mcp_servers: mcpServers,
         messages,
