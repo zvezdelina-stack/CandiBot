@@ -16,22 +16,22 @@ const REPORT_ID = '61729db2-3946-11f1-b952-fb44be0b5cdb';
 const FIELD_IDS = [
   'default:candidate',
   'default:start_time',
-  'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e', // Candidate Function & Level
-  'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d', // Leadership Scope
-  'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e', // Go-to-Market Experience
-  'AI:a9150424-49be-11f1-8e19-179706228ab0', // Company Stage Experience
-  'AI:b04c164c-49be-11f1-9b23-674021cd80ae', // Primary Function
-  'AI:b76395ae-49be-11f1-b7cc-27718543b130', // Cross-Functional Exposure
-  'AI:c3997064-49be-11f1-88cd-e34aef2bf193', // Player/Coach Profile
-  'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46', // Seniority Level
-  'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042', // Comp Context
-  'AI:e07de6f6-49be-11f1-a6c6-2f3b4b019285', // Availability & Timeline
-  'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9', // Deal Size Experience
-  'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915', // Technical Fluency & AI Comfort
-  'AI:ffcd1fa4-49be-11f1-a302-239193bb599f', // Industry & Vertical Background
-  'AI:07343c46-49bf-11f1-ac1a-dbf22856edfb', // Reason for Looking
-  'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2', // Compensation Expectations
-  'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de', // Location
+  'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e',
+  'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d',
+  'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e',
+  'AI:a9150424-49be-11f1-8e19-179706228ab0',
+  'AI:b04c164c-49be-11f1-9b23-674021cd80ae',
+  'AI:b76395ae-49be-11f1-b7cc-27718543b130',
+  'AI:c3997064-49be-11f1-88cd-e34aef2bf193',
+  'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46',
+  'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042',
+  'AI:e07de6f6-49be-11f1-a6c6-2f3b4b019285',
+  'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9',
+  'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915',
+  'AI:ffcd1fa4-49be-11f1-a302-239193bb599f',
+  'AI:07343c46-49bf-11f1-ac1a-dbf22856edfb',
+  'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2',
+  'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de',
 ];
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
@@ -63,7 +63,7 @@ function postJson(hostname, urlPath, headers, body) {
   });
 }
 
-// ── Core: fetch + rank via Claude with Metaview MCP ──────────────────────────
+// ── Core: multi-turn Claude+MCP agentic loop ──────────────────────────────────
 async function fetchAndRankCandidates(jd) {
   const systemPrompt = `You are an expert executive recruiter at SwingSearch, a retained search firm for venture-backed tech startups.
 
@@ -97,44 +97,87 @@ Scoring rubric:
 
 Be precise and opinionated. Do not hedge.`;
 
-  const result = await postJson(
-    'api.anthropic.com',
-    '/v1/messages',
+  const tools = [
     {
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'mcp-client-2025-04-04',
+      type: 'mcp',
+      server_label: 'metaview',
+      server_url: 'https://mcp.metaview.ai/mcp',
+      headers: { Authorization: `Bearer ${METAVIEW_API_KEY}` },
+      allowed_tools: ['search_conversations'],
     },
+  ];
+
+  const messages = [
     {
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 8192,
-      system: systemPrompt,
-      tools: [
-        {
-          type: 'mcp',
-          server_label: 'metaview',
-          server_url: 'https://mcp.metaview.ai/mcp',
-          headers: { Authorization: `Bearer ${METAVIEW_API_KEY}` },
-          allowed_tools: ['search_conversations'],
-        },
-      ],
-      messages: [
-        {
-          role: 'user',
-          content: `JOB DESCRIPTION / SCORECARD:\n\n${jd}\n\nFetch all candidates from the Metaview report and return the ranked JSON.`,
-        },
-      ],
+      role: 'user',
+      content: `JOB DESCRIPTION / SCORECARD:\n\n${jd}\n\nFetch all candidates from the Metaview report and return the ranked JSON.`,
+    },
+  ];
+
+  // Agentic loop — keep going until stop_reason is end_turn or we hit max iterations
+  const MAX_ITERATIONS = 20;
+  let iterations = 0;
+
+  while (iterations < MAX_ITERATIONS) {
+    iterations++;
+    console.log(`Agentic loop iteration ${iterations}, messages: ${messages.length}`);
+
+    const response = await postJson(
+      'api.anthropic.com',
+      '/v1/messages',
+      {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'mcp-client-2025-04-04',
+      },
+      {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 8192,
+        system: systemPrompt,
+        tools,
+        messages,
+      }
+    );
+
+    console.log(`stop_reason: ${response.stop_reason}`);
+    console.log(`content types: ${response.content?.map((b) => b.type).join(', ')}`);
+
+    if (response.error) {
+      throw new Error(`Anthropic API error: ${JSON.stringify(response.error)}`);
     }
-  );
 
-  console.log('Claude stop_reason:', result.stop_reason);
-  console.log('Claude content types:', result.content?.map((b) => b.type));
+    // Append assistant turn to message history
+    messages.push({ role: 'assistant', content: response.content });
 
-  const textBlocks = result.content?.filter((b) => b.type === 'text') ?? [];
-  const text = textBlocks[textBlocks.length - 1]?.text ?? '';
-  const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
-  if (!match) throw new Error(`No JSON in Claude response. Raw: ${text.slice(0, 400)}`);
-  return JSON.parse(match[0]);
+    // If end_turn, extract final text and return
+    if (response.stop_reason === 'end_turn') {
+      const textBlocks = response.content?.filter((b) => b.type === 'text') ?? [];
+      const text = textBlocks[textBlocks.length - 1]?.text ?? '';
+      console.log(`Final text preview: ${text.slice(0, 200)}`);
+      const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
+      if (!match) throw new Error(`No JSON in Claude response. Raw: ${text.slice(0, 400)}`);
+      return JSON.parse(match[0]);
+    }
+
+    // If tool_use, collect all tool use blocks and build tool results
+    if (response.stop_reason === 'tool_use') {
+      const toolUseBlocks = response.content?.filter((b) => b.type === 'tool_use') ?? [];
+      const mcpToolUseBlocks = response.content?.filter((b) => b.type === 'mcp_tool_use') ?? [];
+
+      console.log(`tool_use blocks: ${toolUseBlocks.length}, mcp_tool_use blocks: ${mcpToolUseBlocks.length}`);
+
+      // MCP tool results are handled automatically by the API in mcp-client mode —
+      // we just need to re-submit the conversation with the assistant turn included.
+      // The API appends mcp_tool_result blocks itself on the next turn.
+      // So we just continue the loop — no manual tool result needed.
+      continue;
+    }
+
+    // Any other stop reason — bail
+    throw new Error(`Unexpected stop_reason: ${response.stop_reason}. Content: ${JSON.stringify(response.content?.slice(0, 2))}`);
+  }
+
+  throw new Error(`Agentic loop exceeded ${MAX_ITERATIONS} iterations without completing.`);
 }
 
 // ── Format results for Slack ──────────────────────────────────────────────────
@@ -262,7 +305,6 @@ slackApp.view('rank_candidates_modal', async ({ ack, body, view, client }) => {
 const expressApp = receiver.app;
 expressApp.use(express.json());
 
-// Chrome extension proxy to Anthropic
 expressApp.post('/company-info', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const data = JSON.stringify(req.body);
@@ -289,7 +331,6 @@ expressApp.post('/company-info', (req, res) => {
   apiReq.end();
 });
 
-// DNP list
 expressApp.get('/dnp-list', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   try {
@@ -300,7 +341,6 @@ expressApp.get('/dnp-list', (req, res) => {
   }
 });
 
-// CORS preflight
 expressApp.options('*', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
