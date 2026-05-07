@@ -239,17 +239,21 @@ slackApp.command('/rank-candidates', async ({ ack, body, client }) => {
 
 // Modal submission — run ranking
 slackApp.view('rank_candidates_modal', async ({ ack, body, view, client }) => {
+  // Ack immediately — Slack requires a response within 3 seconds
   await ack();
 
   const jd = view.state.values.jd_block.jd_input.value;
   const { channel_id } = JSON.parse(view.private_metadata ?? '{}');
   const userId = body.user.id;
+  const target = channel_id || userId;
 
+  // Defer all work so the ack has already returned to Slack
+  setImmediate(async () => {
   // Post an immediate holding message
   let holdingTs;
   try {
     const holding = await client.chat.postMessage({
-      channel: channel_id || userId,
+      channel: target,
       text: '⏳ Fetching candidates and running ranking… this usually takes 20–40 seconds.',
     });
     holdingTs = holding.ts;
@@ -270,8 +274,6 @@ slackApp.view('rank_candidates_modal', async ({ ack, body, view, client }) => {
     const jdSnippet = jd.length > 120 ? jd.slice(0, 120) + '…' : jd;
     const blocks = formatResultsForSlack(ranked, jdSnippet);
 
-    const target = channel_id || userId;
-
     // Replace holding message if possible, otherwise post new
     if (holdingTs && channel_id) {
       await client.chat.update({ channel: target, ts: holdingTs, text: 'Ranking complete.', blocks });
@@ -280,7 +282,6 @@ slackApp.view('rank_candidates_modal', async ({ ack, body, view, client }) => {
     }
   } catch (err) {
     console.error('Ranking error:', err);
-    const target = channel_id || userId;
     const errMsg = `❌ Ranking failed: ${err.message ?? 'Unknown error'}. Check Railway logs for details.`;
     if (holdingTs && channel_id) {
       await client.chat.update({ channel: target, ts: holdingTs, text: errMsg });
@@ -288,6 +289,7 @@ slackApp.view('rank_candidates_modal', async ({ ack, body, view, client }) => {
       await client.chat.postMessage({ channel: target, text: errMsg });
     }
   }
+  }); // end setImmediate
 });
 
 // ── Express app (shared with Bolt receiver) ───────────────────────────────────
