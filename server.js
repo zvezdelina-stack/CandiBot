@@ -76,9 +76,19 @@ async function fetchAndRankCandidates(jd) {
   const systemPrompt = `You are an expert executive recruiter at SwingSearch, a retained search firm for venture-backed tech startups.
 
 Your job:
-1. Use the search_conversations Metaview tool to fetch all candidates from report ID "${REPORT_ID}" with fields: ${JSON.stringify(FIELD_IDS)}. Use limit=50 and paginate with offset until has_more is false.
-2. Rank every candidate by fit against the job description or scorecard the user provides.
-3. Return ONLY a valid JSON object — no markdown, no commentary, no backticks.
+1. Read the job description or scorecard and identify the relevant primary function(s) from this exact list: Sales, Marketing, Product, Engineering, Operations, Customer Success, People / HR, Data / Analytics, General Management. Choose all that apply.
+
+2. Use the search_conversations Metaview tool to fetch candidates from report ID "${REPORT_ID}" with:
+   - fields: ${JSON.stringify(FIELD_IDS)}
+   - filters: [{"field_id": "AI:b04c164c-49be-11f1-9b23-674021cd80ae", "operation": "is_one_of", "value": <your chosen function list>}]
+   - limit: 50
+   - offset: 0
+
+3. CRITICAL - YOU MUST PAGINATE. After each response check the has_more field. If has_more is true, call search_conversations again with offset incremented by 50. Keep going until has_more is explicitly false. Do not stop early. Do not rank until you have fetched ALL pages.
+
+4. Once all pages are fetched, rank every candidate by fit against the job description or scorecard.
+
+5. Return ONLY a valid JSON object - no markdown, no commentary, no backticks.
 
 Output format:
 {
