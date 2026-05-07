@@ -1,0 +1,12 @@
+{
+  "name": "swingsearch-overlay-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.17.1",
+    "express": "^4.18.2"
+  }
+}
