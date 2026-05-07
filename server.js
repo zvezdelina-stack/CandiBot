@@ -38,7 +38,7 @@ const FIELD_IDS = [
   'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de',
 ];
 
-// ── HTTP helper (used only for Chrome extension proxy) ────────────────────────
+// ── HTTP helper (Chrome extension proxy only) ─────────────────────────────────
 function postJsonRaw(hostname, urlPath, headers, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
@@ -67,7 +67,7 @@ function postJsonRaw(hostname, urlPath, headers, body) {
   });
 }
 
-// ── Core: fetch + rank via Anthropic SDK with MCP ─────────────────────────────
+// ── Core: streaming agentic loop with Claude+MCP ──────────────────────────────
 async function fetchAndRankCandidates(jd) {
   const systemPrompt = `You are an expert executive recruiter at SwingSearch, a retained search firm for venture-backed tech startups.
 
@@ -101,13 +101,6 @@ Scoring rubric:
 
 Be precise and opinionated. Do not hedge.`;
 
-  const messages = [
-    {
-      role: 'user',
-      content: `JOB DESCRIPTION / SCORECARD:\n\n${jd}\n\nFetch all candidates from the Metaview report and return the ranked JSON.`,
-    },
-  ];
-
   const mcpServers = [
     {
       type: 'url',
@@ -117,60 +110,79 @@ Be precise and opinionated. Do not hedge.`;
     },
   ];
 
-  // Agentic loop
+  const messages = [
+    {
+      role: 'user',
+      content: `JOB DESCRIPTION / SCORECARD:\n\n${jd}\n\nFetch all candidates from the Metaview report and return the ranked JSON.`,
+    },
+  ];
+
   const MAX_ITERATIONS = 20;
   let iterations = 0;
 
   while (iterations < MAX_ITERATIONS) {
     iterations++;
-    console.log(`Agentic iteration ${iterations}, messages: ${messages.length}`);
+    console.log(`Agentic iteration ${iterations}`);
 
-    const response = await anthropic.beta.messages.create(
-      {
-        model: 'claude-sonnet-4-6',
-        max_tokens: 32000,
-        system: systemPrompt,
-        mcp_servers: mcpServers,
-        messages,
-      },
-      {
-        headers: { 'anthropic-beta': 'mcp-client-2025-04-04' },
+    // Use streaming to avoid timeout on long-running calls
+    let fullText = '';
+    let stopReason = null;
+    let responseContent = [];
+
+    const stream = await anthropic.beta.messages
+      .stream(
+        {
+          model: 'claude-sonnet-4-6',
+          max_tokens: 32000,
+          system: systemPrompt,
+          mcp_servers: mcpServers,
+          messages,
+        },
+        { headers: { 'anthropic-beta': 'mcp-client-2025-04-04' } }
+      );
+
+    // Collect the full streamed response
+    for await (const event of stream) {
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        fullText += event.delta.text;
       }
-    );
+      if (event.type === 'message_stop') {
+        stopReason = event.message?.stop_reason;
+      }
+    }
 
-    console.log(`stop_reason: ${response.stop_reason}`);
-    console.log(`content types: ${response.content?.map((b) => b.type).join(', ')}`);
+    // Get the final complete message
+    const finalMessage = await stream.finalMessage();
+    stopReason = finalMessage.stop_reason;
+    responseContent = finalMessage.content;
 
-    // Append assistant turn
-    messages.push({ role: 'assistant', content: response.content });
+    console.log(`stop_reason: ${stopReason}`);
+    console.log(`content types: ${responseContent.map((b) => b.type).join(', ')}`);
 
-    if (response.stop_reason === 'end_turn') {
-      const textBlocks = response.content?.filter((b) => b.type === 'text') ?? [];
+    // Append assistant turn to messages
+    messages.push({ role: 'assistant', content: responseContent });
+
+    if (stopReason === 'end_turn') {
+      const textBlocks = responseContent.filter((b) => b.type === 'text');
       const text = textBlocks[textBlocks.length - 1]?.text ?? '';
       console.log(`Final text preview: ${text.slice(0, 300)}`);
       const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
-      if (!match) throw new Error(`No JSON in Claude response. Raw: ${text.slice(0, 400)}`);
+      if (!match) throw new Error(`No JSON in response. Raw: ${text.slice(0, 400)}`);
       return JSON.parse(match[0]);
     }
 
-    if (response.stop_reason === 'tool_use') {
-      // MCP tool results come back automatically on next turn via the SDK
-      // Build the user turn with tool results for any mcp_tool_use blocks
-      const mcpToolUseBlocks = response.content?.filter((b) => b.type === 'mcp_tool_use') ?? [];
-      const regularToolUseBlocks = response.content?.filter((b) => b.type === 'tool_use') ?? [];
-
-      console.log(`mcp_tool_use: ${mcpToolUseBlocks.length}, tool_use: ${regularToolUseBlocks.length}`);
-
-      // For mcp_tool_use the SDK handles results internally — just continue
-      if (mcpToolUseBlocks.length > 0 && regularToolUseBlocks.length === 0) {
-        continue;
+    if (stopReason === 'tool_use') {
+      // MCP tool results are handled by the SDK automatically on next iteration
+      const mcpBlocks = responseContent.filter((b) => b.type === 'mcp_tool_use');
+      const regularBlocks = responseContent.filter((b) => b.type === 'tool_use');
+      console.log(`mcp_tool_use: ${mcpBlocks.length}, tool_use: ${regularBlocks.length}`);
+      if (regularBlocks.length > 0) {
+        throw new Error('Unexpected regular tool_use blocks — only MCP tools are supported.');
       }
-
-      // Fallback: if regular tool_use blocks exist, we can't handle them here
-      throw new Error(`Unexpected regular tool_use blocks in response.`);
+      continue;
     }
 
-    throw new Error(`Unexpected stop_reason: ${response.stop_reason}`);
+    throw new Error(`Unexpected stop_reason: ${stopReason}`);
   }
 
   throw new Error(`Loop exceeded ${MAX_ITERATIONS} iterations.`);
@@ -183,7 +195,10 @@ function formatResultsForSlack(ranked, jdSnippet) {
 
   const blocks = [
     { type: 'header', text: { type: 'plain_text', text: '🔍 Candidate Ranking Results', emoji: true } },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `*Criteria:* ${jdSnippet}  •  *${ranked.length} candidates ranked*` }] },
+    {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `*Criteria:* ${jdSnippet}  •  *${ranked.length} candidates ranked*` }],
+    },
     { type: 'divider' },
   ];
 
@@ -208,7 +223,12 @@ function formatResultsForSlack(ranked, jdSnippet) {
   if (ranked.length > 10) {
     blocks.push({
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: `_${ranked.length - 10} additional candidates not shown. Run the full ranker artifact in Claude for the complete list._` }],
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `_${ranked.length - 10} additional candidates not shown. Run the full ranker artifact in Claude for the complete list._`,
+        },
+      ],
     });
   }
 
@@ -243,7 +263,10 @@ slackApp.command('/rank-candidates', async ({ ack, body, client }) => {
             type: 'plain_text_input',
             action_id: 'jd_input',
             multiline: true,
-            placeholder: { type: 'plain_text', text: 'Paste the job description, scorecard, or key criteria here…' },
+            placeholder: {
+              type: 'plain_text',
+              text: 'Paste the job description, scorecard, or key criteria here…',
+            },
           },
           hint: { type: 'plain_text', text: 'The more specific, the better the ranking.' },
         },
@@ -265,7 +288,7 @@ slackApp.view('rank_candidates_modal', async ({ ack, body, view, client }) => {
     try {
       const holding = await client.chat.postMessage({
         channel: target,
-        text: '⏳ Fetching candidates and running ranking… this usually takes 30–60 seconds.',
+        text: '⏳ Fetching candidates and running ranking… this usually takes 1–2 minutes.',
       });
       holdingTs = holding.ts;
     } catch (e) {
@@ -317,7 +340,9 @@ expressApp.post('/company-info', (req, res) => {
     (apiRes) => {
       let buf = '';
       apiRes.on('data', (c) => (buf += c));
-      apiRes.on('end', () => res.status(apiRes.statusCode).set('Content-Type', 'application/json').send(buf));
+      apiRes.on('end', () =>
+        res.status(apiRes.statusCode).set('Content-Type', 'application/json').send(buf)
+      );
     }
   );
   apiReq.on('error', (e) => res.status(500).json({ error: e.message }));
