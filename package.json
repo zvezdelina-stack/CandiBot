@@ -1,13 +1,16 @@
 {
-  "name": "swingsearch-overlay-backend",
+  "name": "candibot",
   "version": "1.0.0",
+  "description": "SwingSearch recruiting companion for Slack",
+  "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
-    "@slack/bolt": "^3.17.1",
+    "@slack/bolt": "^3.19.0",
     "@upstash/redis": "^1.34.0",
     "express": "^4.18.2"
   }
