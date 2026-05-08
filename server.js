@@ -64,103 +64,203 @@ async function getRanking(id) {
   return typeof raw === 'string' ? JSON.parse(raw) : raw;
 }
 
-// ── Core: streaming agentic loop with Claude+MCP ──────────────────────────────
-async function fetchAndRankCandidates(jd) {
-  const systemPrompt = `You are an expert executive recruiter at SwingSearch, a retained search firm for venture-backed tech startups.
+// ── Step 1: Server-controlled Metaview pagination ────────────────────────────
+async function inferFunctionsFromJD(jd) {
+  // Use Claude to extract the relevant function(s) from the JD — single fast call
+  const res = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 200,
+    system: `You map job descriptions to primary function categories. Return ONLY a JSON array of matching values from this exact list, nothing else:
+["Sales", "Marketing", "Product", "Engineering", "Operations", "Customer Success", "People / HR", "Data / Analytics", "General Management"]
+Example output: ["Sales"] or ["Marketing", "Sales"]`,
+    messages: [{ role: 'user', content: jd }]
+  });
+  const text = res.content.find(b => b.type === 'text')?.text ?? '';
+  const match = text.match(/\[[\s\S]*?\]/);
+  if (!match) return ['Sales', 'Marketing', 'Product', 'Engineering', 'Operations', 'Customer Success', 'People / HR', 'Data / Analytics', 'General Management'];
+  return JSON.parse(match[0]);
+}
 
-Your job:
-1. Read the job description or scorecard and identify the relevant primary function(s) from this exact list: Sales, Marketing, Product, Engineering, Operations, Customer Success, People / HR, Data / Analytics, General Management. Choose all that apply.
+async function fetchCandidatesFromMetaview(functions) {
+  // Fetch ALL pages directly via Metaview MCP — server controls pagination
+  const mcpServers = [{ type: 'url', url: 'https://mcp.metaview.ai/mcp', name: 'metaview', authorization_token: METAVIEW_API_KEY }];
+  let allCandidates = [];
+  let offset = 0;
+  let hasMore = true;
+  let page = 0;
 
-2. Use the search_conversations Metaview tool to fetch candidates from report ID "${REPORT_ID}" with:
-   - fields: ${JSON.stringify(FIELD_IDS)}
-   - filters: [
-       {"field_id": "AI:b04c164c-49be-11f1-9b23-674021cd80ae", "operation": "is_one_of", "value": <your chosen function list>},
-       {"field_id": "default:start_time", "operation": "after", "value": {"scope": "relative", "value": -63072000}}
-     ]
-   - limit: 50
-   - offset: 0
+  while (hasMore) {
+    page++;
+    console.log(`Fetching page ${page} (offset ${offset})...`);
 
-3. CRITICAL - YOU MUST PAGINATE. After each response check the has_more field. If has_more is true, wait 2 seconds then call search_conversations again with offset incremented by 50. Keep going until has_more is explicitly false. Do not stop early. Do not rank until you have fetched ALL pages.
+    const stream = await anthropic.beta.messages.stream(
+      {
+        model: 'claude-sonnet-4-6',
+        max_tokens: 8192,
+        system: 'You are a Metaview API proxy. Call search_conversations with the exact parameters provided. Return ONLY the raw JSON from the tool result — no commentary, no explanation.',
+        mcp_servers: mcpServers,
+        messages: [{
+          role: 'user',
+          content: `Call search_conversations with these exact parameters and return the raw JSON result:
+${JSON.stringify({
+  report_id: REPORT_ID,
+  fields: FIELD_IDS,
+  filters: [
+    { field_id: 'AI:b04c164c-49be-11f1-9b23-674021cd80ae', operation: 'is_one_of', value: functions },
+    { field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }
+  ],
+  limit: 50,
+  offset
+}, null, 2)}`
+        }]
+      },
+      { headers: { 'anthropic-beta': 'mcp-client-2025-04-04' } }
+    );
 
-4. Once all pages are fetched, rank every candidate by fit against the job description or scorecard.
+    const finalMessage = await stream.finalMessage();
+    const textBlocks = finalMessage.content.filter(b => b.type === 'text');
+    const toolResults = finalMessage.content.filter(b => b.type === 'mcp_tool_result');
 
-5. Return ONLY a valid JSON object - no markdown, no commentary, no backticks.
+    // Try tool result first, then text
+    let parsed = null;
+    const raw = toolResults[0]?.content?.[0]?.text ?? textBlocks[textBlocks.length - 1]?.text ?? '';
+    try { parsed = JSON.parse(raw); } catch {
+      const match = raw.match(/\{[\s\S]*\}/);
+      if (match) try { parsed = JSON.parse(match[0]); } catch {}
+    }
+
+    if (!parsed || !parsed.conversations) {
+      console.log(`Page ${page}: no conversations found, stopping.`);
+      break;
+    }
+
+    allCandidates = allCandidates.concat(parsed.conversations);
+    hasMore = parsed.has_more ?? false;
+    offset += parsed.conversations.length;
+    console.log(`Page ${page}: fetched ${parsed.conversations.length}, total so far: ${allCandidates.length}, has_more: ${hasMore}`);
+
+    if (hasMore) await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+
+  return allCandidates;
+}
+
+// ── Step 2: Single Claude ranking call ────────────────────────────────────────
+function getVal(conv, fieldId) {
+  const entries = conv.fields?.[fieldId];
+  if (!entries?.length) return null;
+  const labels = entries.map(e => e.label ?? e.value).filter(Boolean);
+  return labels.length ? labels.join(', ') : null;
+}
+
+async function rankCandidatesWithClaude(jd, candidates) {
+  const profiles = candidates.map((c, i) => ({
+    index: i,
+    name:            getVal(c, 'default:candidate') ?? `Candidate ${i + 1}`,
+    url:             c.url,
+    functionLevel:   getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
+    seniority:       getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+    playerCoach:     getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
+    leadershipScope: getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
+    gtm:             getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+    companyStage:    getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+    industry:        getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
+    dealSize:        getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
+    techFluency:     getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+  }));
+
+  // Chunk candidates into batches of 80 to stay under token limits
+  const CHUNK_SIZE = 80;
+  const chunks = [];
+  for (let i = 0; i < profiles.length; i += CHUNK_SIZE) {
+    chunks.push(profiles.slice(i, i + CHUNK_SIZE));
+  }
+
+  console.log(`Ranking ${profiles.length} candidates in ${chunks.length} chunk(s)...`);
+
+  const allRanked = [];
+
+  for (let ci = 0; ci < chunks.length; ci++) {
+    console.log(`Ranking chunk ${ci + 1}/${chunks.length}...`);
+    if (ci > 0) await new Promise(resolve => setTimeout(resolve, 2000));
+
+    const res = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 16000,
+      system: `You are an expert executive recruiter at SwingSearch, a retained search firm for venture-backed tech startups.
+Rank every candidate by fit against the job description. Return ONLY valid JSON — no markdown, no backticks.
 
 Output format:
 {
   "ranked": [
     {
-      "name": "<candidate name>",
+      "index": <original index>,
       "score": <0-100>,
-      "tier": "Strong Fit" | "Possible Fit" | "Not a Fit",
-      "headline": "<one sharp sentence on why they fit or don't>",
-      "strengths": ["<strength 1>", "<strength 2>", "<strength 3>"],
-      "gaps": ["<gap 1>", "<gap 2>"],
-      "note": "<one additional nuanced observation>",
-      "functionLevel": "<value or null>",
-      "seniority": "<value or null>",
-      "playerCoach": "<value or null>",
-      "leadershipScope": "<value or null>",
-      "gtm": "<value or null>",
-      "companyStage": "<value or null>",
-      "crossFunctional": "<value or null>",
-      "compContext": "<value or null>",
-      "availability": "<value or null>",
-      "dealSize": "<value or null>",
-      "techFluency": "<value or null>",
-      "industry": "<value or null>",
-      "reasonForLooking": "<value or null>",
-      "location": "<value or null>",
-      "interviewer": "<value or null>",
-      "date": "<value or null>",
-      "url": "<conversation url or null>"
+      "tier": "Strong Fit" | "Possible Fit",
+      "headline": "<one sharp sentence>",
+      "strengths": ["<s1>", "<s2>", "<s3>"],
+      "gaps": ["<g1>", "<g2>"],
+      "note": "<one nuanced observation>"
     }
   ]
 }
 
-Scoring: 80-100 Strong Fit, 50-79 Possible Fit, 0-49 Not a Fit. Be precise and opinionated.`;
+IMPORTANT: Only include candidates with score >= 50. Do not return Not a Fit candidates at all.
+Scoring: 80-100 Strong Fit, 50-79 Possible Fit. Be precise and opinionated.`,
+      messages: [{
+        role: 'user',
+        content: `JOB DESCRIPTION:
+${jd}
 
-  const mcpServers = [{ type: 'url', url: 'https://mcp.metaview.ai/mcp', name: 'metaview', authorization_token: METAVIEW_API_KEY }];
-  const messages = [{ role: 'user', content: `JOB DESCRIPTION / SCORECARD:\n\n${jd}\n\nFetch all candidates and return the ranked JSON.` }];
-  const MAX_ITERATIONS = 20;
-  let iterations = 0;
+CANDIDATES:
+${JSON.stringify(chunks[ci], null, 2)}`
+      }]
+    });
 
-  while (iterations < MAX_ITERATIONS) {
-    iterations++;
-    console.log(`Agentic iteration ${iterations}`);
-
-    const stream = await anthropic.beta.messages.stream(
-      { model: 'claude-sonnet-4-6', max_tokens: 32000, system: systemPrompt, mcp_servers: mcpServers, messages },
-      { headers: { 'anthropic-beta': 'mcp-client-2025-04-04' } }
-    );
-
-    const finalMessage = await stream.finalMessage();
-    const stopReason = finalMessage.stop_reason;
-    const responseContent = finalMessage.content;
-
-    console.log(`stop_reason: ${stopReason}, content types: ${responseContent.map(b => b.type).join(', ')}`);
-    messages.push({ role: 'assistant', content: responseContent });
-
-    if (stopReason === 'end_turn') {
-      const textBlocks = responseContent.filter(b => b.type === 'text');
-      const text = textBlocks[textBlocks.length - 1]?.text ?? '';
-      const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
-      if (!match) throw new Error(`No JSON in response. Raw: ${text.slice(0, 400)}`);
-      return JSON.parse(match[0]);
-    }
-
-    if (stopReason === 'tool_use') {
-      const regularBlocks = responseContent.filter(b => b.type === 'tool_use');
-      if (regularBlocks.length > 0) throw new Error('Unexpected regular tool_use blocks.');
-      // Wait 2 seconds between pages to stay under rate limits
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      continue;
-    }
-
-    throw new Error(`Unexpected stop_reason: ${stopReason}`);
+    const text = res.content.find(b => b.type === 'text')?.text ?? '';
+    const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
+    if (!match) { console.log(`Chunk ${ci + 1}: no JSON found, skipping`); continue; }
+    const parsed = JSON.parse(match[0]);
+    allRanked.push(...(parsed.ranked ?? []));
   }
 
-  throw new Error(`Loop exceeded ${MAX_ITERATIONS} iterations.`);
+  // Merge rank data back with full candidate info
+  return allRanked.map(r => {
+    const c = candidates[r.index];
+    return {
+      ...r,
+      name:            getVal(c, 'default:candidate') ?? `Candidate ${r.index + 1}`,
+      url:             c.url,
+      functionLevel:   getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
+      seniority:       getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+      playerCoach:     getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
+      leadershipScope: getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
+      gtm:             getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+      companyStage:    getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+      industry:        getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
+      dealSize:        getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
+      techFluency:     getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+    };
+  }).sort((a, b) => b.score - a.score);
+}
+
+// ── Orchestrator ──────────────────────────────────────────────────────────────
+async function fetchAndRankCandidates(jd) {
+  console.log('Step 1: Inferring functions from JD...');
+  const functions = await inferFunctionsFromJD(jd);
+  console.log('Functions:', functions);
+
+  console.log('Step 2: Fetching candidates from Metaview...');
+  const candidates = await fetchCandidatesFromMetaview(functions);
+  console.log(`Fetched ${candidates.length} total candidates.`);
+
+  if (!candidates.length) throw new Error('No candidates found matching this search criteria.');
+
+  console.log('Step 3: Ranking candidates...');
+  const ranked = await rankCandidatesWithClaude(jd, candidates);
+  console.log(`Ranking complete: ${ranked.length} qualifying candidates.`);
+
+  return { ranked };
 }
 
 // ── Hosted ranking page HTML ──────────────────────────────────────────────────
@@ -168,7 +268,6 @@ function buildRankingHTML(rankingData) {
   const { jdSnippet, createdAt, ranked } = rankingData;
   const strong   = ranked.filter(r => r.tier === 'Strong Fit');
   const possible = ranked.filter(r => r.tier === 'Possible Fit');
-  const notFit   = ranked.filter(r => r.tier === 'Not a Fit');
 
   const tierColor = { 'Strong Fit': '#1B7A4A', 'Possible Fit': '#9B6C1A', 'Not a Fit': '#8B2635' };
   const tierBg    = { 'Strong Fit': 'rgba(27,122,74,0.08)', 'Possible Fit': 'rgba(200,150,30,0.08)', 'Not a Fit': 'rgba(200,69,108,0.06)' };
@@ -391,13 +490,11 @@ function buildRankingHTML(rankingData) {
       <div><div class="stat-num" style="color:#1B2B4B">${ranked.length}</div><div class="stat-label">Total</div></div>
       <div><div class="stat-num" style="color:#1B7A4A">${strong.length}</div><div class="stat-label">Strong Fit</div></div>
       <div><div class="stat-num" style="color:#9B6C1A">${possible.length}</div><div class="stat-label">Possible Fit</div></div>
-      <div><div class="stat-num" style="color:#8B2635">${notFit.length}</div><div class="stat-label">Not a Fit</div></div>
     </div>
   </div>
 
   ${sectionHTML('Strong Fit', strong, 1)}
   ${sectionHTML('Possible Fit', possible, strong.length + 1)}
-  ${sectionHTML('Not a Fit', notFit, strong.length + possible.length + 1)}
 </div>
 
 <script>
@@ -514,7 +611,7 @@ slackApp.view('rank_candidates_modal', async ({ ack, body, view, client }) => {
 
       const blocks = [
         { type: 'header', text: { type: 'plain_text', text: '✅ Candidate Ranking Ready', emoji: true } },
-        { type: 'section', text: { type: 'mrkdwn', text: `*${ranked.length} candidates ranked* against:\n_${jdSnippet}_` } },
+        { type: 'section', text: { type: 'mrkdwn', text: `*${ranked.length} qualifying candidates* found against:\n_${jdSnippet}_` } },
         { type: 'section', fields: [
           { type: 'mrkdwn', text: `*🟢 Strong Fit*\n${strong} candidates` },
           { type: 'mrkdwn', text: `*🟡 Possible Fit*\n${possible} candidates` },
