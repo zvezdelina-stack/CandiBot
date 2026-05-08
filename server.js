@@ -1,61 +1,71 @@
-const fs = require('fs');
-const path = require('path');
-const https = require('https');
-const crypto = require('crypto');
-const express = require('express');
-const { App, ExpressReceiver } = require('@slack/bolt');
-const Anthropic = require('@anthropic-ai/sdk');
-const { Redis } = require('@upstash/redis');
+import pkg from '@slack/bolt';
+const { App } = pkg;
+import Anthropic from '@anthropic-ai/sdk';
+import { Redis } from '@upstash/redis';
+import crypto from 'crypto';
+import express from 'express';
+import https from 'https';
 
 // ── Env ───────────────────────────────────────────────────────────────────────
-const PORT                   = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY      = process.env.ANTHROPIC_API_KEY;
 const SLACK_BOT_TOKEN        = process.env.SLACK_BOT_TOKEN;
+const SLACK_APP_TOKEN        = process.env.SLACK_APP_TOKEN;
 const SLACK_SIGNING_SECRET   = process.env.SLACK_SIGNING_SECRET;
 const METAVIEW_API_KEY       = process.env.METAVIEW_API_KEY;
 const RANKING_PASSWORD       = process.env.RANKING_PASSWORD;
 const UPSTASH_REDIS_REST_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const PUBLIC_URL             = process.env.PUBLIC_URL || 'https://candibot-production.up.railway.app';
+const PORT                   = process.env.PORT || 8080;
 
 // ── Clients ───────────────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-const redis = new Redis({
-  url: UPSTASH_REDIS_REST_URL,
-  token: UPSTASH_REDIS_REST_TOKEN,
-});
+const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const REPORT_ID = '61729db2-3946-11f1-b952-fb44be0b5cdb';
-const RANKING_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+const RANKING_TTL  = 30 * 24 * 60 * 60; // 30 days in seconds
+const SESSION_TTL  = 60 * 60;            // 1 hour in seconds
+const MCP_SERVERS  = [{ type: 'url', url: 'https://mcp.metaview.ai/mcp', name: 'metaview', authorization_token: METAVIEW_API_KEY }];
+
 const FIELD_IDS = [
-  'default:candidate',                        // Candidate name
-  'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e', // Candidate Function & Level
-  'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46', // Seniority Level
-  'AI:c3997064-49be-11f1-88cd-e34aef2bf193', // Player/Coach Profile
+  'default:candidate',
+  'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e', // Function & Level
+  'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46', // Seniority
+  'AI:c3997064-49be-11f1-88cd-e34aef2bf193', // Player/Coach
   'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d', // Leadership Scope
-  'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e', // Go-to-Market Experience
-  'AI:a9150424-49be-11f1-8e19-179706228ab0', // Company Stage Experience
-  'AI:ffcd1fa4-49be-11f1-a302-239193bb599f', // Industry & Vertical Background
-  'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9', // Deal Size Experience
-  'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915', // Technical Fluency & AI Comfort
+  'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e', // GTM
+  'AI:a9150424-49be-11f1-8e19-179706228ab0', // Company Stage
+  'AI:ffcd1fa4-49be-11f1-a302-239193bb599f', // Industry
+  'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9', // Deal Size
+  'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915', // Tech Fluency
 ];
 
-// ── HTTP helper (Chrome extension proxy) ─────────────────────────────────────
-function postJsonRaw(hostname, urlPath, headers, body) {
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body);
-    const req = https.request(
-      { hostname, path: urlPath, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), ...headers } },
-      (res) => { let buf = ''; res.on('data', c => buf += c); res.on('end', () => { try { resolve(JSON.parse(buf)); } catch { resolve(buf); } }); }
-    );
-    req.on('error', reject); req.write(data); req.end();
-  });
+// ── Session management ────────────────────────────────────────────────────────
+// Stores per-user context: active search, last candidate discussed, etc.
+async function getSession(userId) {
+  try {
+    const raw = await redis.get(`session:${userId}`);
+    if (!raw) return {};
+    return typeof raw === 'string' ? JSON.parse(raw) : raw;
+  } catch { return {}; }
 }
 
-// ── Redis helpers ─────────────────────────────────────────────────────────────
+async function setSession(userId, data) {
+  try {
+    const current = await getSession(userId);
+    const updated = { ...current, ...data, updatedAt: Date.now() };
+    await redis.set(`session:${userId}`, JSON.stringify(updated), { ex: SESSION_TTL });
+  } catch (e) { console.error('Session write error:', e.message); }
+}
+
+async function clearSession(userId) {
+  try { await redis.del(`session:${userId}`); } catch {}
+}
+
+// ── Ranking storage ───────────────────────────────────────────────────────────
 async function saveRanking(id, data) {
-  await redis.set(`ranking:${id}`, JSON.stringify(data), { ex: RANKING_TTL_SECONDS });
+  await redis.set(`ranking:${id}`, JSON.stringify(data), { ex: RANKING_TTL });
 }
 
 async function getRanking(id) {
@@ -64,88 +74,51 @@ async function getRanking(id) {
   return typeof raw === 'string' ? JSON.parse(raw) : raw;
 }
 
-// ── Step 1: Server-controlled Metaview pagination ────────────────────────────
-async function inferFunctionsFromJD(jd) {
-  // Use Claude to extract the relevant function(s) from the JD — single fast call
+// ── Intent detection ──────────────────────────────────────────────────────────
+const INTENTS = {
+  RANK:       'rank',       // "rank candidates for this VP Sales role"
+  FIND:       'find',       // "find me engineers with fintech background"
+  LOOKUP:     'lookup',     // "pull up John Smith" / "tell me about Sarah Lee"
+  SUMMARIZE:  'summarize',  // "summarize the last 5 sales calls"
+  HELP:       'help',       // "help" / "what can you do"
+  RESET:      'reset',      // "start over" / "reset"
+  UNKNOWN:    'unknown',
+};
+
+async function detectIntent(message, session) {
   const res = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 200,
-    system: `You map job descriptions to primary function categories. Return ONLY a JSON array of matching values from this exact list, nothing else:
-["Sales", "Marketing", "Product", "Engineering", "Operations", "Customer Success", "People / HR", "Data / Analytics", "General Management"]
-Example output: ["Sales"] or ["Marketing", "Sales"]`,
-    messages: [{ role: 'user', content: jd }]
+    system: `You classify recruiter messages into intents. Return ONLY a JSON object with "intent" and "entities".
+
+Intents:
+- rank: user wants to rank/score candidates against a role or JD
+- find: user wants to search for candidates matching criteria
+- lookup: user wants info on a specific named candidate
+- summarize: user wants a summary of conversations or a candidate
+- help: user wants to know what the bot can do
+- reset: user wants to clear context and start fresh
+- unknown: none of the above
+
+Entities to extract:
+- name: candidate name if mentioned
+- role: job title or function if mentioned
+- criteria: any search criteria mentioned
+- jd: job description text if pasted (long text)
+
+Current session context: ${JSON.stringify(session)}
+
+Return format: {"intent": "rank", "entities": {"role": "VP Sales", "jd": null}}`,
+    messages: [{ role: 'user', content: message }]
   });
+
   const text = res.content.find(b => b.type === 'text')?.text ?? '';
-  const match = text.match(/\[[\s\S]*?\]/);
-  if (!match) return ['Sales', 'Marketing', 'Product', 'Engineering', 'Operations', 'Customer Success', 'People / HR', 'Data / Analytics', 'General Management'];
-  return JSON.parse(match[0]);
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return { intent: INTENTS.UNKNOWN, entities: {} };
+  try { return JSON.parse(match[0]); } catch { return { intent: INTENTS.UNKNOWN, entities: {} }; }
 }
 
-async function fetchCandidatesFromMetaview(functions) {
-  // Fetch ALL pages directly via Metaview MCP — server controls pagination
-  const mcpServers = [{ type: 'url', url: 'https://mcp.metaview.ai/mcp', name: 'metaview', authorization_token: METAVIEW_API_KEY }];
-  let allCandidates = [];
-  let offset = 0;
-  let hasMore = true;
-  let page = 0;
-
-  while (hasMore) {
-    page++;
-    console.log(`Fetching page ${page} (offset ${offset})...`);
-
-    const stream = await anthropic.beta.messages.stream(
-      {
-        model: 'claude-sonnet-4-6',
-        max_tokens: 8192,
-        system: 'You are a Metaview API proxy. Call search_conversations with the exact parameters provided. Return ONLY the raw JSON from the tool result — no commentary, no explanation.',
-        mcp_servers: mcpServers,
-        messages: [{
-          role: 'user',
-          content: `Call search_conversations with these exact parameters and return the raw JSON result:
-${JSON.stringify({
-  report_id: REPORT_ID,
-  fields: FIELD_IDS,
-  filters: [
-    { field_id: 'AI:b04c164c-49be-11f1-9b23-674021cd80ae', operation: 'is_one_of', value: functions },
-    { field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }
-  ],
-  limit: 50,
-  offset
-}, null, 2)}`
-        }]
-      },
-      { headers: { 'anthropic-beta': 'mcp-client-2025-04-04' } }
-    );
-
-    const finalMessage = await stream.finalMessage();
-    const textBlocks = finalMessage.content.filter(b => b.type === 'text');
-    const toolResults = finalMessage.content.filter(b => b.type === 'mcp_tool_result');
-
-    // Try tool result first, then text
-    let parsed = null;
-    const raw = toolResults[0]?.content?.[0]?.text ?? textBlocks[textBlocks.length - 1]?.text ?? '';
-    try { parsed = JSON.parse(raw); } catch {
-      const match = raw.match(/\{[\s\S]*\}/);
-      if (match) try { parsed = JSON.parse(match[0]); } catch {}
-    }
-
-    if (!parsed || !parsed.conversations) {
-      console.log(`Page ${page}: no conversations found, stopping.`);
-      break;
-    }
-
-    allCandidates = allCandidates.concat(parsed.conversations);
-    hasMore = parsed.has_more ?? false;
-    offset += parsed.conversations.length;
-    console.log(`Page ${page}: fetched ${parsed.conversations.length}, total so far: ${allCandidates.length}, has_more: ${hasMore}`);
-
-    if (hasMore) await new Promise(resolve => setTimeout(resolve, 2000));
-  }
-
-  return allCandidates;
-}
-
-// ── Step 2: Single Claude ranking call ────────────────────────────────────────
+// ── Metaview helpers ──────────────────────────────────────────────────────────
 function getVal(conv, fieldId) {
   const entries = conv.fields?.[fieldId];
   if (!entries?.length) return null;
@@ -153,531 +126,596 @@ function getVal(conv, fieldId) {
   return labels.length ? labels.join(', ') : null;
 }
 
-async function rankCandidatesWithClaude(jd, candidates) {
-  const profiles = candidates.map((c, i) => ({
-    index: i,
-    name:            getVal(c, 'default:candidate') ?? `Candidate ${i + 1}`,
-    url:             c.url,
-    functionLevel:   getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
-    seniority:       getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
-    playerCoach:     getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
-    leadershipScope: getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
-    gtm:             getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
-    companyStage:    getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
-    industry:        getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
-    dealSize:        getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
-    techFluency:     getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
-  }));
-
-  // Chunk candidates into batches of 80 to stay under token limits
-  const CHUNK_SIZE = 80;
-  const chunks = [];
-  for (let i = 0; i < profiles.length; i += CHUNK_SIZE) {
-    chunks.push(profiles.slice(i, i + CHUNK_SIZE));
-  }
-
-  console.log(`Ranking ${profiles.length} candidates in ${chunks.length} chunk(s)...`);
-
-  const allRanked = [];
-
-  for (let ci = 0; ci < chunks.length; ci++) {
-    console.log(`Ranking chunk ${ci + 1}/${chunks.length}...`);
-    if (ci > 0) await new Promise(resolve => setTimeout(resolve, 2000));
-
-    const res = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 16000,
-      system: `You are an expert executive recruiter at SwingSearch, a retained search firm for venture-backed tech startups.
-Rank every candidate by fit against the job description. Return ONLY valid JSON — no markdown, no backticks.
-
-Output format:
-{
-  "ranked": [
+// Run a single Metaview MCP call via Claude and extract the tool result
+async function metaviewCall(toolName, params) {
+  const stream = await anthropic.beta.messages.stream(
     {
-      "index": <original index>,
-      "score": <0-100>,
-      "tier": "Strong Fit" | "Possible Fit",
-      "headline": "<one sharp sentence>",
-      "strengths": ["<s1>", "<s2>", "<s3>"],
-      "gaps": ["<g1>", "<g2>"],
-      "note": "<one nuanced observation>"
-    }
-  ]
+      model: 'claude-sonnet-4-6',
+      max_tokens: 8192,
+      system: `You are a Metaview API proxy. Call the ${toolName} tool with EXACTLY the parameters provided. Return nothing else.`,
+      mcp_servers: MCP_SERVERS,
+      messages: [{ role: 'user', content: `Call ${toolName} with these parameters: ${JSON.stringify(params)}` }]
+    },
+    { headers: { 'anthropic-beta': 'mcp-client-2025-04-04' } }
+  );
+
+  const final = await stream.finalMessage();
+  const mcpResults = final.content.filter(b => b.type === 'mcp_tool_result');
+  const textBlocks = final.content.filter(b => b.type === 'text');
+
+  for (const block of mcpResults) {
+    const raw = block.content?.[0]?.text ?? '';
+    try { return JSON.parse(raw); } catch {}
+  }
+  for (const block of textBlocks) {
+    const match = block.text?.match(/\{[\s\S]*\}/);
+    if (match) { try { return JSON.parse(match[0]); } catch {} }
+  }
+  return null;
 }
 
-IMPORTANT: Only include candidates with score >= 50. Do not return Not a Fit candidates at all.
-Scoring: 80-100 Strong Fit, 50-79 Possible Fit. Be precise and opinionated.`,
-      messages: [{
-        role: 'user',
-        content: `JOB DESCRIPTION:
-${jd}
+// Fetch all candidates matching filters, paginating server-side
+async function fetchCandidates(filters) {
+  let all = [], offset = 0, hasMore = true, page = 0;
 
-CANDIDATES:
-${JSON.stringify(chunks[ci], null, 2)}`
-      }]
+  while (hasMore) {
+    page++;
+    console.log(`Fetching page ${page} (offset ${offset})...`);
+
+    const result = await metaviewCall('search_conversations', {
+      report_id: REPORT_ID,
+      fields: FIELD_IDS,
+      filters,
+      limit: 50,
+      offset,
+      sort_by: 'default:start_time',
+      sort_ascending: false
     });
 
-    const text = res.content.find(b => b.type === 'text')?.text ?? '';
-    const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
-    if (!match) { console.log(`Chunk ${ci + 1}: no JSON found, skipping`); continue; }
-    const parsed = JSON.parse(match[0]);
-    allRanked.push(...(parsed.ranked ?? []));
+    if (!result?.conversations?.length) {
+      console.log(`Page ${page}: no results, stopping.`);
+      break;
+    }
+
+    all = all.concat(result.conversations);
+    hasMore = result.has_more ?? false;
+    offset += result.conversations.length;
+    console.log(`Page ${page}: +${result.conversations.length}, total: ${all.length}, has_more: ${hasMore}`);
+
+    if (hasMore) await new Promise(r => setTimeout(r, 2000));
   }
 
-  // Merge rank data back with full candidate info
-  return allRanked.map(r => {
-    const c = candidates[r.index];
-    return {
-      ...r,
-      name:            getVal(c, 'default:candidate') ?? `Candidate ${r.index + 1}`,
-      url:             c.url,
-      functionLevel:   getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
-      seniority:       getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
-      playerCoach:     getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
+  return all;
+}
+
+// ── Intent handlers ───────────────────────────────────────────────────────────
+
+// RANK: confirm function/level then hand off to Claude artifact
+async function handleRank(say, userId, entities, session) {
+  const role = entities.role ?? session.activeRole;
+  const jd   = entities.jd;
+
+  // If we have a JD pasted directly, save it to session and proceed
+  if (jd && jd.length > 100) {
+    await setSession(userId, { pendingJD: jd, pendingRole: role });
+    await say({
+      text: `Got it. Before I open the ranker, let me confirm the search criteria.`,
+      blocks: [
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: `📋 *Ranking request received*\n\nI'll open the SwingSearch Candidate Ranker for you. Paste the same JD there to run the full ranking — it's faster and handles the full candidate pool.\n\n*<https://claude.ai|Open Claude →>* then find the Candidate Ranker conversation.\n\nOnce the ranking is complete the results will be saved and I'll post the link here.` }
+        }
+      ]
+    });
+    return;
+  }
+
+  // If no JD yet, ask for it
+  if (!role && !jd) {
+    await say("What role are you ranking candidates for? You can paste a job description or just describe the key criteria.");
+    await setSession(userId, { awaitingRankInput: true });
+    return;
+  }
+
+  // We have a role but no JD — confirm and ask for more detail
+  await say(`Got it — ranking for *${role}*. Paste the full job description or scorecard and I'll open the ranker for you.`);
+  await setSession(userId, { activeRole: role, awaitingRankInput: true });
+}
+
+// LOOKUP: find and summarize a specific candidate
+async function handleLookup(say, userId, entities, session) {
+  const name = entities.name ?? session.lastCandidate;
+
+  if (!name) {
+    await say("Who would you like me to look up? Give me a name and I'll pull their profile.");
+    await setSession(userId, { awaitingName: true });
+    return;
+  }
+
+  await say(`_Looking up ${name} in Metaview..._`);
+
+  try {
+    // Search for the candidate by name
+    const result = await metaviewCall('search_conversations', {
+      report_id: REPORT_ID,
+      fields: [...FIELD_IDS, 'default:start_time', 'default:interviewer'],
+      filters: [{ field_id: 'default:candidate', operation: 'like_one_of', value: [name] }],
+      limit: 5,
+      sort_by: 'default:start_time',
+      sort_ascending: false
+    });
+
+    if (!result?.conversations?.length) {
+      await say(`I couldn't find anyone named *${name}* in the Candidate Interviews report. Double-check the spelling or try a partial name.`);
+      return;
+    }
+
+    const convs = result.conversations;
+    await setSession(userId, { lastCandidate: name, lastCandidateConvs: convs.map(c => c.id) });
+
+    // Build a summary using Claude
+    const profiles = convs.map(c => ({
+      name: getVal(c, 'default:candidate'),
+      date: c.fields?.['default:start_time']?.[0]?.label,
+      interviewer: getVal(c, 'default:interviewer'),
+      functionLevel: getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
+      seniority: getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+      playerCoach: getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
       leadershipScope: getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
-      gtm:             getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
-      companyStage:    getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
-      industry:        getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
-      dealSize:        getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
-      techFluency:     getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
-    };
-  }).sort((a, b) => b.score - a.score);
+      gtm: getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+      companyStage: getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+      industry: getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
+      dealSize: getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
+      techFluency: getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+      url: c.url,
+    }));
+
+    const summaryRes = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 600,
+      system: `You are a recruiter's assistant at SwingSearch. Summarize a candidate's profile concisely for a Slack message. Be specific and useful. Use plain text — no markdown headers, no bullet points with dashes. Keep it under 200 words. End with their Metaview link.`,
+      messages: [{ role: 'user', content: `Summarize this candidate: ${JSON.stringify(profiles[0])}` }]
+    });
+
+    const summary = summaryRes.content.find(b => b.type === 'text')?.text ?? '';
+
+    const blocks = [
+      { type: 'section', text: { type: 'mrkdwn', text: `*${profiles[0].name ?? name}*${profiles[0].functionLevel ? `  ·  ${profiles[0].functionLevel}` : ''}` } },
+      { type: 'section', text: { type: 'mrkdwn', text: summary } },
+    ];
+
+    if (convs.length > 1) {
+      blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_${convs.length} interviews on file. Showing most recent._` }] });
+    }
+
+    await say({ text: `Found ${name}`, blocks });
+
+  } catch (err) {
+    console.error('Lookup error:', err);
+    await say(`Something went wrong looking up ${name}. Check Railway logs for details.`);
+  }
 }
 
-// ── Orchestrator ──────────────────────────────────────────────────────────────
-async function fetchAndRankCandidates(jd) {
-  console.log('Step 1: Inferring functions from JD...');
-  const functions = await inferFunctionsFromJD(jd);
-  console.log('Functions:', functions);
+// FIND: natural language candidate search
+async function handleFind(say, userId, entities, session) {
+  const criteria = entities.criteria;
 
-  console.log('Step 2: Fetching candidates from Metaview...');
-  const candidates = await fetchCandidatesFromMetaview(functions);
-  console.log(`Fetched ${candidates.length} total candidates.`);
+  if (!criteria) {
+    await say("What are you looking for? Describe the candidate you have in mind — function, seniority, industry, GTM experience, whatever matters most.");
+    await setSession(userId, { awaitingFindCriteria: true });
+    return;
+  }
 
-  if (!candidates.length) throw new Error('No candidates found matching this search criteria.');
+  await say(`_Searching for ${criteria}..._`);
 
-  console.log('Step 3: Ranking candidates...');
-  const ranked = await rankCandidatesWithClaude(jd, candidates);
-  console.log(`Ranking complete: ${ranked.length} qualifying candidates.`);
+  try {
+    // Use Claude to translate criteria into Metaview filters
+    const filterRes = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 400,
+      system: `You translate recruiter search criteria into Metaview filter arrays. Return ONLY a JSON array of filter objects, no other text.
 
-  return { ranked };
+Available filter fields:
+- Primary Function: field_id "AI:b04c164c-49be-11f1-9b23-674021cd80ae", operation "is_one_of", values from: ["Sales", "Marketing", "Product", "Engineering", "Operations", "Customer Success", "People / HR", "Data / Analytics", "General Management"]
+- Date: field_id "default:start_time", operation "after", value must be {"scope": "relative", "value": -63072000} for 24 months
+
+Always include the 24-month date filter. Include function filter if function is clear from criteria.
+
+Example output: [{"field_id": "AI:b04c164c-49be-11f1-9b23-674021cd80ae", "operation": "is_one_of", "value": ["Sales"]}, {"field_id": "default:start_time", "operation": "after", "value": {"scope": "relative", "value": -63072000}}]`,
+      messages: [{ role: 'user', content: criteria }]
+    });
+
+    const filterText = filterRes.content.find(b => b.type === 'text')?.text ?? '';
+    const filterMatch = filterText.match(/\[[\s\S]*\]/);
+    if (!filterMatch) throw new Error('Could not parse filters from criteria');
+    const filters = JSON.parse(filterMatch[0]);
+
+    const candidates = await fetchCandidates(filters);
+
+    if (!candidates.length) {
+      await say(`No candidates found matching "${criteria}" in the last 24 months.`);
+      return;
+    }
+
+    // Score and filter top matches using Claude
+    const profiles = candidates.map((c, i) => ({
+      index: i,
+      name: getVal(c, 'default:candidate') ?? `Candidate ${i+1}`,
+      url: c.url,
+      functionLevel: getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
+      seniority: getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+      leadershipScope: getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
+      gtm: getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+      companyStage: getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+      industry: getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
+      dealSize: getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
+      techFluency: getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+    }));
+
+    // Chunk if large
+    const CHUNK = 80;
+    let topMatches = [];
+    for (let i = 0; i < profiles.length; i += CHUNK) {
+      if (i > 0) await new Promise(r => setTimeout(r, 2000));
+      const chunk = profiles.slice(i, i + CHUNK);
+      const res = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4000,
+        system: `You are a recruiter's assistant at SwingSearch. Find the top candidates matching search criteria. Return ONLY valid JSON — no markdown.
+
+Output: {"matches": [{"index": <n>, "score": <0-100>, "reason": "<one sentence why they match>"}]}
+
+Only include candidates with score >= 60. Maximum 8 candidates. Be selective and opinionated.`,
+        messages: [{ role: 'user', content: `SEARCH CRITERIA: ${criteria}\n\nCANDIDATES: ${JSON.stringify(chunk, null, 2)}` }]
+      });
+
+      const text = res.content.find(b => b.type === 'text')?.text ?? '';
+      const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        topMatches = topMatches.concat(parsed.matches ?? []);
+      }
+    }
+
+    // Sort and take top 8
+    topMatches = topMatches.sort((a, b) => b.score - a.score).slice(0, 8);
+
+    if (!topMatches.length) {
+      await say(`Found ${candidates.length} candidates in that function but none scored above 60% match for "${criteria}". Try broader criteria.`);
+      return;
+    }
+
+    await setSession(userId, { lastSearch: criteria, lastResults: topMatches.map(m => profiles[m.index]?.name) });
+
+    const blocks = [
+      { type: 'header', text: { type: 'plain_text', text: `🔍 Top matches for: ${criteria.slice(0, 60)}`, emoji: true } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: `${topMatches.length} candidates found from ${candidates.length} screened` }] },
+      { type: 'divider' },
+    ];
+
+    topMatches.forEach((m, i) => {
+      const p = profiles[m.index];
+      if (!p) return;
+      blocks.push({
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*${i+1}. ${p.url ? `<${p.url}|${p.name}>` : p.name}*${p.functionLevel ? `  ·  ${p.functionLevel}` : ''}\n${m.reason}`
+        }
+      });
+      if (i < topMatches.length - 1) blocks.push({ type: 'divider' });
+    });
+
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_Say "tell me more about [name]" for a deeper profile on any candidate._` }] });
+
+    await say({ text: `Found ${topMatches.length} matches`, blocks });
+
+  } catch (err) {
+    console.error('Find error:', err);
+    await say(`Something went wrong with that search. ${err.message}`);
+  }
 }
 
-// ── Hosted ranking page HTML ──────────────────────────────────────────────────
+// HELP: show capabilities
+async function handleHelp(say) {
+  await say({
+    text: 'Here\'s what I can do',
+    blocks: [
+      { type: 'header', text: { type: 'plain_text', text: 'CandiBot — What I can do', emoji: true } },
+      { type: 'section', text: { type: 'mrkdwn', text: '*🔍 Find candidates*\nDescribe what you\'re looking for in plain English.\n_"Find me VP Sales candidates with enterprise SaaS experience"_' } },
+      { type: 'divider' },
+      { type: 'section', text: { type: 'mrkdwn', text: '*👤 Look up a candidate*\nGet a quick profile on anyone we\'ve screened.\n_"Pull up Indy Sen"_ or _"Tell me about Sarah Lee"_' } },
+      { type: 'divider' },
+      { type: 'section', text: { type: 'mrkdwn', text: '*📊 Rank candidates*\nScore your full pipeline against a role or JD.\n_"Rank candidates for the VP Sales role at AmberBox"_\nI\'ll open the Claude ranker and post the results link here.' } },
+      { type: 'divider' },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: '_Say "reset" to clear context and start fresh._' }] },
+    ]
+  });
+}
+
+// ── Main message router ───────────────────────────────────────────────────────
+async function routeMessage(say, userId, text) {
+  // Load session
+  const session = await getSession(userId);
+
+  // Detect intent
+  const { intent, entities } = await detectIntent(text, session);
+  console.log(`User ${userId} intent: ${intent}`, entities);
+
+  // Route to handler
+  switch (intent) {
+    case INTENTS.RANK:
+      await handleRank(say, userId, entities, session);
+      break;
+    case INTENTS.LOOKUP:
+    case INTENTS.SUMMARIZE:
+      await handleLookup(say, userId, entities, session);
+      break;
+    case INTENTS.FIND:
+      await handleFind(say, userId, entities, session);
+      break;
+    case INTENTS.RESET:
+      await clearSession(userId);
+      await say("Context cleared. What are we working on?");
+      break;
+    case INTENTS.HELP:
+      await handleHelp(say);
+      break;
+    default:
+      // Check if we're awaiting specific input from a previous turn
+      if (session.awaitingRankInput) {
+        await setSession(userId, { awaitingRankInput: false });
+        await handleRank(say, userId, { ...entities, jd: text.length > 100 ? text : null, role: entities.role ?? text }, session);
+      } else if (session.awaitingName) {
+        await setSession(userId, { awaitingName: false });
+        await handleLookup(say, userId, { name: text }, session);
+      } else if (session.awaitingFindCriteria) {
+        await setSession(userId, { awaitingFindCriteria: false });
+        await handleFind(say, userId, { criteria: text }, session);
+      } else {
+        await say("I didn't quite get that. Try asking me to find candidates, look someone up, or rank your pipeline — or say *help* to see everything I can do.");
+      }
+  }
+}
+
+// ── Slack app (Socket Mode) ───────────────────────────────────────────────────
+const slackApp = new App({
+  token: SLACK_BOT_TOKEN,
+  appToken: SLACK_APP_TOKEN,
+  signingSecret: SLACK_SIGNING_SECRET,
+  socketMode: true,
+});
+
+// Handle all DMs
+slackApp.message(async ({ message, say }) => {
+  if (message.bot_id || message.subtype) return;
+  const text = message.text?.trim();
+  if (!text) return;
+
+  // Acknowledge immediately, then process
+  try {
+    await routeMessage(say, message.user, text);
+  } catch (err) {
+    console.error('Message handler error:', err);
+    await say("Something went wrong on my end. Try again in a moment.");
+  }
+});
+
+// /help slash command
+slackApp.command('/candibot-help', async ({ ack, say }) => {
+  await ack();
+  await handleHelp(say);
+});
+
+// ── Hosted ranking page (Express, separate port) ──────────────────────────────
+// Railway exposes one public port — we use the same process but a separate
+// internal HTTP server for serving hosted ranking pages.
+const expressApp = express();
+expressApp.use(express.json());
+
+expressApp.get('/ranking/:id', async (req, res) => {
+  try {
+    const data = await getRanking(req.params.id);
+    if (!data) return res.status(404).send('<h2 style="font-family:sans-serif;padding:40px">Ranking not found or expired.</h2>');
+    res.set('Content-Type', 'text/html').send(buildRankingHTML(data));
+  } catch (e) {
+    console.error('Ranking fetch error:', e);
+    res.status(500).send('<h2 style="font-family:sans-serif;padding:40px">Error loading ranking.</h2>');
+  }
+});
+
+// Save ranking endpoint — called by the Claude artifact
+expressApp.post('/save-ranking', express.json(), async (req, res) => {
+  try {
+    const { ranked, jdSnippet } = req.body;
+    if (!ranked?.length) return res.status(400).json({ error: 'No ranked candidates provided' });
+    const id = crypto.randomBytes(8).toString('hex');
+    await saveRanking(id, { jdSnippet, createdAt: new Date().toISOString(), ranked });
+    res.json({ url: `${PUBLIC_URL}/ranking/${id}` });
+  } catch (e) {
+    console.error('Save ranking error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+expressApp.listen(PORT, () => console.log(`Express server on port ${PORT}`));
+
+// ── Hosted ranking HTML ───────────────────────────────────────────────────────
 function buildRankingHTML(rankingData) {
   const { jdSnippet, createdAt, ranked } = rankingData;
   const strong   = ranked.filter(r => r.tier === 'Strong Fit');
   const possible = ranked.filter(r => r.tier === 'Possible Fit');
 
-  const tierColor = { 'Strong Fit': '#1B7A4A', 'Possible Fit': '#9B6C1A', 'Not a Fit': '#8B2635' };
-  const tierBg    = { 'Strong Fit': 'rgba(27,122,74,0.08)', 'Possible Fit': 'rgba(200,150,30,0.08)', 'Not a Fit': 'rgba(200,69,108,0.06)' };
-  const tierBorder = { 'Strong Fit': 'rgba(27,122,74,0.25)', 'Possible Fit': 'rgba(200,150,30,0.25)', 'Not a Fit': 'rgba(200,69,108,0.2)' };
+  const tierColor  = { 'Strong Fit': '#1B7A4A', 'Possible Fit': '#9B6C1A' };
+  const tierBg     = { 'Strong Fit': 'rgba(27,122,74,0.08)', 'Possible Fit': 'rgba(200,150,30,0.08)' };
+  const tierBorder = { 'Strong Fit': 'rgba(27,122,74,0.25)', 'Possible Fit': 'rgba(200,150,30,0.25)' };
 
   function cardHTML(r, rank) {
-    const tc = tierColor[r.tier] ?? '#8B2635';
-    const tb = tierBg[r.tier] ?? 'rgba(200,69,108,0.06)';
-    const tbd = tierBorder[r.tier] ?? 'rgba(200,69,108,0.2)';
-    const strengths = (r.strengths ?? []).map(s => `<div class="bullet green">+&nbsp;${s}</div>`).join('');
+    const tc = tierColor[r.tier] ?? '#9B6C1A';
+    const tb = tierBg[r.tier] ?? 'rgba(200,150,30,0.08)';
+    const tbd = tierBorder[r.tier] ?? 'rgba(200,150,30,0.25)';
+    const strengths = (r.strengths ?? []).map(s => `<div class="bullet green">+ ${s}</div>`).join('');
     const gaps = (r.gaps ?? []).length
-      ? (r.gaps ?? []).map(g => `<div class="bullet rose">–&nbsp;${g}</div>`).join('')
+      ? (r.gaps ?? []).map(g => `<div class="bullet rose">– ${g}</div>`).join('')
       : '<div style="color:#B0BEC9;font-size:12px">None identified</div>';
     const details = [
       ['Seniority', r.seniority], ['Player/Coach', r.playerCoach], ['Leadership Scope', r.leadershipScope],
-      ['Company Stage', r.companyStage], ['GTM Experience', r.gtm], ['Deal Size', r.dealSize],
-      ['Comp Context', r.compContext], ['Availability', r.availability], ['Tech Fluency', r.techFluency],
-      ['Industry', r.industry], ['Cross-Functional', r.crossFunctional], ['Reason for Looking', r.reasonForLooking],
-    ].filter(([,v]) => v).map(([label, val]) => `
-      <div>
-        <div class="detail-label">${label}</div>
-        <div class="detail-value">${val}</div>
-      </div>`).join('');
+      ['Company Stage', r.companyStage], ['GTM', r.gtm], ['Deal Size', r.dealSize],
+      ['Tech Fluency', r.techFluency], ['Industry', r.industry],
+    ].filter(([,v]) => v).map(([l, v]) => `<div><div class="dl">${l}</div><div class="dv">${v}</div></div>`).join('');
 
-    return `
-    <div class="card" style="border-left-color:${tc}" onclick="toggleCard(this)">
-      <div class="card-header">
+    return `<div class="card" style="border-left-color:${tc}" onclick="toggleCard(this)">
+      <div class="ch">
         <div class="rank">#${rank}</div>
         <div class="score" style="color:${tc};background:${tb};border-color:${tbd}">${r.score}</div>
-        <div class="card-main">
-          <div class="name-row">
-            ${r.url ? `<a href="${r.url}" target="_blank" onclick="event.stopPropagation()" class="name-link">${r.name}</a>` : `<span class="name">${r.name}</span>`}
-            ${r.functionLevel ? `<span class="meta">${r.functionLevel}</span>` : ''}
-            ${r.location ? `<span class="meta dim">· ${r.location}</span>` : ''}
-          </div>
-          <div class="headline">${r.headline}</div>
+        <div class="cm">
+          <div class="nr">${r.url ? `<a href="${r.url}" target="_blank" onclick="event.stopPropagation()" class="nl">${r.name}</a>` : `<span class="nm">${r.name}</span>`}${r.functionLevel ? `<span class="mt">${r.functionLevel}</span>` : ''}</div>
+          <div class="hl">${r.headline}</div>
         </div>
-        <div class="tier-pill" style="color:${tc};background:${tb};border-color:${tbd}">${r.tier}</div>
-        <div class="chevron">▾</div>
+        <div class="tp" style="color:${tc};background:${tb};border-color:${tbd}">${r.tier}</div>
+        <div class="cv">▾</div>
       </div>
-      <div class="card-detail">
-        <div class="sg-grid">
-          <div>
-            <div class="section-label green-label">Strengths</div>
-            ${strengths}
-          </div>
-          <div>
-            <div class="section-label rose-label">Gaps</div>
-            ${gaps}
-          </div>
-        </div>
-        ${r.note ? `<div class="note-box"><div class="detail-label">Recruiter Note</div><div style="font-size:13px;color:#2C3E55;line-height:1.6">${r.note}</div></div>` : ''}
-        <div class="detail-grid">${details}</div>
-        <div class="card-footer">
-          ${r.interviewer ? `<span>Interviewed by <b>${r.interviewer}</b></span>` : ''}
-          ${r.date ? `<span>${r.date}</span>` : ''}
-          ${r.url ? `<a href="${r.url}" target="_blank" class="mv-link">View in Metaview →</a>` : ''}
-        </div>
+      <div class="cd">
+        <div class="sg"><div><div class="sl green-l">Strengths</div>${strengths}</div><div><div class="sl rose-l">Gaps</div>${gaps}</div></div>
+        ${r.note ? `<div class="nb"><div class="dl">Recruiter Note</div><div style="font-size:13px;color:#2C3E55;line-height:1.6">${r.note}</div></div>` : ''}
+        <div class="dg">${details}</div>
+        ${r.url ? `<div class="cf"><a href="${r.url}" target="_blank" class="mvl">View in Metaview →</a></div>` : ''}
       </div>
     </div>`;
   }
 
   function sectionHTML(tier, candidates, startRank) {
     if (!candidates.length) return '';
-    const cards = candidates.map((r, i) => cardHTML(r, startRank + i)).join('');
-    return `
-    <div class="tier-section">
-      <div class="tier-header" onclick="toggleSection(this)">
-        <div class="tier-line" style="background:${tierBorder[tier]}"></div>
-        <div class="tier-title" style="color:${tierColor[tier]}">${tier}</div>
-        <div class="tier-count">(${candidates.length})</div>
-        <div class="tier-flex"></div>
-        <div class="tier-chevron">▾</div>
+    return `<div class="ts">
+      <div class="th" onclick="toggleSection(this)">
+        <div style="height:1px;width:24px;background:${tierBorder[tier]};flex-shrink:0"></div>
+        <div class="tt" style="color:${tierColor[tier]}">${tier}</div>
+        <div class="tc">(${candidates.length})</div>
+        <div style="flex:1;height:1px;background:#F0F4F8"></div>
+        <div class="tch">▾</div>
       </div>
-      <div class="tier-body">${cards}</div>
+      <div class="tb">${candidates.map((r, i) => cardHTML(r, startRank + i)).join('')}</div>
     </div>`;
   }
-
-  const csvData = JSON.stringify(ranked.map((r, i) => ({
-    rank: i+1, name: r.name, score: r.score, tier: r.tier,
-    functionLevel: r.functionLevel, location: r.location, seniority: r.seniority,
-    playerCoach: r.playerCoach, companyStage: r.companyStage, gtm: r.gtm,
-    availability: r.availability, compContext: r.compContext, dealSize: r.dealSize,
-    techFluency: r.techFluency, industry: r.industry, reasonForLooking: r.reasonForLooking,
-    headline: r.headline,
-    strengths: (r.strengths ?? []).join('; '),
-    gaps: (r.gaps ?? []).join('; '),
-    url: r.url,
-  })));
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Candidate Ranking — SwingSearch</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Lato:wght@300;400;700;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Lato',sans-serif;background:#F7F9FC;color:#1B2B4B;min-height:100vh}
-  a{color:inherit;text-decoration:none}
-
-  /* Auth overlay */
-  #auth-overlay{position:fixed;inset:0;background:#1B2B4B;display:flex;align-items:center;justify-content:center;z-index:100}
-  .auth-box{background:#fff;border-radius:12px;padding:40px;width:360px;text-align:center}
-  .auth-logo{font-family:'Playfair Display',serif;font-size:22px;font-weight:700;color:#1B2B4B;margin-bottom:4px}
-  .auth-sub{font-size:12px;color:#8899AA;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:28px}
-  .auth-input{width:100%;border:1px solid #DDE4EE;border-radius:6px;padding:10px 14px;font-size:14px;font-family:'Lato',sans-serif;color:#1B2B4B;margin-bottom:12px}
-  .auth-input:focus{outline:none;border-color:#C8456C}
-  .auth-btn{width:100%;background:#C8456C;color:#fff;border:none;border-radius:6px;padding:11px;font-size:13px;font-family:'Lato',sans-serif;font-weight:700;cursor:pointer;letter-spacing:0.05em}
-  .auth-error{font-size:12px;color:#C8456C;margin-top:8px;display:none}
-
-  /* Header */
-  .header{background:#1B2B4B;padding:18px 40px;display:flex;align-items:center;justify-content:space-between}
-  .header-left{display:flex;align-items:baseline;gap:14px}
-  .brand{font-family:'Playfair Display',serif;font-size:20px;font-weight:700;color:#fff}
-  .sep{color:rgba(255,255,255,0.3);font-size:14px}
-  .page-title{font-size:12px;color:rgba(255,255,255,0.5);letter-spacing:0.1em;text-transform:uppercase}
-  .export-btn{background:transparent;border:1px solid rgba(200,69,108,0.6);color:#C8456C;border-radius:6px;padding:7px 16px;font-size:12px;font-family:'Lato',sans-serif;cursor:pointer;font-weight:700;letter-spacing:0.05em}
-
-  /* Main */
-  .main{max-width:880px;margin:0 auto;padding:40px 24px 80px}
-
-  /* Summary */
-  .summary{padding-bottom:24px;border-bottom:1px solid #E8EDF3;margin-bottom:32px}
-  .summary-eyebrow{font-size:11px;color:#8899AA;letter-spacing:0.1em;text-transform:uppercase;font-weight:700;margin-bottom:6px}
-  .summary-title{font-family:'Playfair Display',serif;font-size:18px;color:#1B2B4B;font-weight:600;margin-bottom:16px}
-  .summary-stats{display:flex;gap:28px}
-  .stat-num{font-family:'Playfair Display',serif;font-size:26px;font-weight:700}
-  .stat-label{font-size:11px;color:#8899AA;text-transform:uppercase;letter-spacing:0.08em;margin-top:2px}
-
-  /* Tier section */
-  .tier-section{margin-bottom:32px}
-  .tier-header{display:flex;align-items:center;gap:12px;margin-bottom:12px;cursor:pointer;user-select:none}
-  .tier-line{height:1px;width:24px;flex-shrink:0}
-  .tier-title{font-family:'Playfair Display',serif;font-size:16px;font-weight:600}
-  .tier-count{font-size:12px;color:#B0BEC9}
-  .tier-flex{flex:1;height:1px;background:#F0F4F8}
-  .tier-chevron{font-size:11px;color:#B0BEC9;transition:transform 0.2s}
-  .tier-header.collapsed .tier-chevron{transform:rotate(-90deg)}
-  .tier-body.hidden{display:none}
-
-  /* Card */
-  .card{background:#fff;border:1px solid #E8EDF3;border-left:3px solid #ccc;border-radius:8px;margin-bottom:8px;overflow:hidden;transition:box-shadow 0.2s,border-color 0.2s;cursor:pointer}
-  .card:hover{box-shadow:0 4px 16px rgba(27,43,75,0.08)}
-  .card.open{box-shadow:0 4px 20px rgba(27,43,75,0.1)}
-  .card-header{padding:14px 18px;display:flex;align-items:center;gap:14px}
-  .rank{font-size:11px;color:#B0BEC9;width:22px;text-align:right;flex-shrink:0}
-  .score{border-radius:6px;border:1px solid;padding:3px 10px;font-size:14px;font-weight:700;flex-shrink:0;min-width:40px;text-align:center}
-  .card-main{flex:1;min-width:0}
-  .name-row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
-  .name-link{font-family:'Playfair Display',serif;font-size:15px;font-weight:600;color:#1B2B4B;border-bottom:1px solid #C8456C}
-  .name{font-family:'Playfair Display',serif;font-size:15px;font-weight:600;color:#1B2B4B}
-  .meta{font-size:11px;color:#8899AA}
-  .meta.dim{color:#B0BEC9}
-  .headline{font-size:12px;color:#677A8E;margin-top:3px;line-height:1.5}
-  .tier-pill{border-radius:20px;border:1px solid;padding:3px 10px;font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;flex-shrink:0}
-  .chevron{color:#B0BEC9;font-size:12px;transition:transform 0.2s;flex-shrink:0}
-  .card.open .chevron{transform:rotate(180deg)}
-
-  /* Card detail */
-  .card-detail{display:none;padding:0 18px 18px 54px;border-top:1px solid #F0F4F8}
-  .card.open .card-detail{display:block}
-  .sg-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:16px;margin-bottom:16px}
-  .section-label{font-size:10px;letter-spacing:0.1em;text-transform:uppercase;font-weight:700;margin-bottom:8px}
-  .green-label{color:#1B7A4A}
-  .rose-label{color:#C8456C}
-  .bullet{font-size:12px;color:#2C3E55;margin-bottom:6px;padding-left:14px;position:relative;line-height:1.55}
-  .bullet.green::before{content:'+';position:absolute;left:0;color:#1B7A4A;font-weight:700}
-  .bullet.rose::before{content:'–';position:absolute;left:0;color:#C8456C;font-weight:700}
-  .note-box{background:rgba(27,43,75,0.04);border:1px solid rgba(27,43,75,0.08);border-radius:6px;padding:10px 14px;margin-bottom:16px}
-  .detail-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px 24px}
-  .detail-label{font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:#8899AA;font-weight:700;margin-bottom:3px}
-  .detail-value{font-size:13px;color:#2C3E55;line-height:1.5}
-  .card-footer{margin-top:14px;display:flex;gap:20px;flex-wrap:wrap;border-top:1px solid #F0F4F8;padding-top:12px;font-size:11px;color:#B0BEC9;align-items:center}
-  .card-footer b{color:#677A8E;font-weight:400}
-  .mv-link{color:#C8456C;margin-left:auto;font-size:11px}
-
-  @media(max-width:600px){
-    .header{padding:14px 16px}
-    .main{padding:24px 16px 60px}
-    .sg-grid,.detail-grid{grid-template-columns:1fr}
-    .card-header{flex-wrap:wrap}
-    .tier-pill{display:none}
-    .summary-stats{gap:16px}
-  }
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Lato',sans-serif;background:#F7F9FC;color:#1B2B4B;min-height:100vh}a{color:inherit;text-decoration:none}
+#ao{position:fixed;inset:0;background:#1B2B4B;display:flex;align-items:center;justify-content:center;z-index:100}
+.ab{background:#fff;border-radius:12px;padding:40px;width:360px;text-align:center}
+.al{font-family:'Playfair Display',serif;font-size:22px;font-weight:700;color:#1B2B4B;margin-bottom:4px}
+.as{font-size:12px;color:#8899AA;letter-spacing:.1em;text-transform:uppercase;margin-bottom:28px}
+.ai{width:100%;border:1px solid #DDE4EE;border-radius:6px;padding:10px 14px;font-size:14px;font-family:'Lato',sans-serif;color:#1B2B4B;margin-bottom:12px}
+.ai:focus{outline:none;border-color:#C8456C}
+.abtn{width:100%;background:#C8456C;color:#fff;border:none;border-radius:6px;padding:11px;font-size:13px;font-family:'Lato',sans-serif;font-weight:700;cursor:pointer}
+.aerr{font-size:12px;color:#C8456C;margin-top:8px;display:none}
+.hdr{background:#1B2B4B;padding:18px 40px;display:flex;align-items:center;justify-content:space-between}
+.br{font-family:'Playfair Display',serif;font-size:20px;font-weight:700;color:#fff}
+.sep{color:rgba(255,255,255,.3);font-size:14px;margin:0 14px}
+.pt{font-size:12px;color:rgba(255,255,255,.5);letter-spacing:.1em;text-transform:uppercase}
+.ebtn{background:transparent;border:1px solid rgba(200,69,108,.6);color:#C8456C;border-radius:6px;padding:7px 16px;font-size:12px;font-family:'Lato',sans-serif;cursor:pointer;font-weight:700;letter-spacing:.05em}
+.main{max-width:880px;margin:0 auto;padding:40px 24px 80px}
+.sm{padding-bottom:24px;border-bottom:1px solid #E8EDF3;margin-bottom:32px}
+.se{font-size:11px;color:#8899AA;letter-spacing:.1em;text-transform:uppercase;font-weight:700;margin-bottom:6px}
+.st{font-family:'Playfair Display',serif;font-size:18px;color:#1B2B4B;font-weight:600;margin-bottom:8px}
+.sd{font-size:11px;color:#B0BEC9;margin-bottom:16px}
+.ss{display:flex;gap:28px}
+.sn{font-family:'Playfair Display',serif;font-size:26px;font-weight:700}
+.sl2{font-size:11px;color:#8899AA;text-transform:uppercase;letter-spacing:.08em;margin-top:2px}
+.ts{margin-bottom:32px}
+.th{display:flex;align-items:center;gap:12px;margin-bottom:12px;cursor:pointer;user-select:none}
+.tt{font-family:'Playfair Display',serif;font-size:16px;font-weight:600}
+.tc{font-size:12px;color:#B0BEC9}
+.tch{font-size:11px;color:#B0BEC9;transition:transform .2s}
+.th.collapsed .tch{transform:rotate(-90deg)}
+.tb.hidden{display:none}
+.card{background:#fff;border:1px solid #E8EDF3;border-left:3px solid;border-radius:8px;margin-bottom:8px;overflow:hidden;transition:box-shadow .2s;cursor:pointer}
+.card:hover{box-shadow:0 4px 16px rgba(27,43,75,.08)}
+.ch{padding:14px 18px;display:flex;align-items:center;gap:14px}
+.rank{font-size:11px;color:#B0BEC9;width:22px;text-align:right;flex-shrink:0}
+.score{border-radius:6px;border:1px solid;padding:3px 10px;font-size:14px;font-weight:700;flex-shrink:0;min-width:40px;text-align:center}
+.cm{flex:1;min-width:0}
+.nr{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.nl{font-family:'Playfair Display',serif;font-size:15px;font-weight:600;color:#1B2B4B;border-bottom:1px solid #C8456C}
+.nm{font-family:'Playfair Display',serif;font-size:15px;font-weight:600;color:#1B2B4B}
+.mt{font-size:11px;color:#8899AA}
+.hl{font-size:12px;color:#677A8E;margin-top:3px;line-height:1.5}
+.tp{border-radius:20px;border:1px solid;padding:3px 10px;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;flex-shrink:0}
+.cv{color:#B0BEC9;font-size:12px;transition:transform .2s;flex-shrink:0}
+.card.open .cv{transform:rotate(180deg)}
+.cd{display:none;padding:0 18px 18px 54px;border-top:1px solid #F0F4F8}
+.card.open .cd{display:block}
+.sg{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:16px;margin-bottom:16px}
+.sl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;font-weight:700;margin-bottom:8px}
+.green-l{color:#1B7A4A}.rose-l{color:#C8456C}
+.bullet{font-size:12px;color:#2C3E55;margin-bottom:6px;padding-left:14px;position:relative;line-height:1.55}
+.bullet.green::before{content:'+';position:absolute;left:0;color:#1B7A4A;font-weight:700}
+.bullet.rose::before{content:'–';position:absolute;left:0;color:#C8456C;font-weight:700}
+.nb{background:rgba(27,43,75,.04);border:1px solid rgba(27,43,75,.08);border-radius:6px;padding:10px 14px;margin-bottom:16px}
+.dg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px 24px}
+.dl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#8899AA;font-weight:700;margin-bottom:3px}
+.dv{font-size:13px;color:#2C3E55;line-height:1.5}
+.cf{margin-top:14px;border-top:1px solid #F0F4F8;padding-top:12px}
+.mvl{color:#C8456C;font-size:11px}
+@media(max-width:600px){.hdr{padding:14px 16px}.main{padding:24px 16px 60px}.sg,.dg{grid-template-columns:1fr}.tp{display:none}.ss{gap:16px}}
 </style>
 </head>
 <body>
-
-<!-- Auth overlay -->
-<div id="auth-overlay">
-  <div class="auth-box">
-    <div class="auth-logo">SwingSearch</div>
-    <div class="auth-sub">Candidate Ranking</div>
-    <input id="pw-input" type="password" placeholder="Team password" class="auth-input" onkeydown="if(event.key==='Enter')checkAuth()">
-    <button class="auth-btn" onclick="checkAuth()">View Rankings</button>
-    <div id="auth-error" class="auth-error">Incorrect password</div>
+<div id="ao">
+  <div class="ab">
+    <div class="al">SwingSearch</div>
+    <div class="as">Candidate Ranking</div>
+    <input id="pw" type="password" placeholder="Team password" class="ai" onkeydown="if(event.key==='Enter')auth()">
+    <button class="abtn" onclick="auth()">View Rankings</button>
+    <div id="ae" class="aerr">Incorrect password</div>
   </div>
 </div>
-
-<!-- Header -->
-<div class="header">
-  <div class="header-left">
-    <span class="brand">SwingSearch</span>
-    <span class="sep">/</span>
-    <span class="page-title">Candidate Ranking</span>
+<div class="hdr">
+  <div style="display:flex;align-items:center">
+    <span class="br">SwingSearch</span><span class="sep">/</span><span class="pt">Candidate Ranking</span>
   </div>
-  <button class="export-btn" onclick="exportCSV()">Export CSV</button>
+  <button class="ebtn" onclick="exportCSV()">Export CSV</button>
 </div>
-
-<!-- Main -->
-<div class="main" id="main-content" style="display:none">
-  <div class="summary">
-    <div class="summary-eyebrow">Ranked against</div>
-    <div class="summary-title">${jdSnippet}</div>
-    <div style="font-size:11px;color:#B0BEC9;font-family:'Lato',sans-serif;margin-bottom:14px">Generated ${new Date(createdAt).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} · Expires in 30 days</div>
-    <div class="summary-stats">
-      <div><div class="stat-num" style="color:#1B2B4B">${ranked.length}</div><div class="stat-label">Total</div></div>
-      <div><div class="stat-num" style="color:#1B7A4A">${strong.length}</div><div class="stat-label">Strong Fit</div></div>
-      <div><div class="stat-num" style="color:#9B6C1A">${possible.length}</div><div class="stat-label">Possible Fit</div></div>
+<div class="main" id="mc" style="display:none">
+  <div class="sm">
+    <div class="se">Ranked against</div>
+    <div class="st">${jdSnippet}</div>
+    <div class="sd">Generated ${new Date(createdAt).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} · Expires in 30 days</div>
+    <div class="ss">
+      <div><div class="sn" style="color:#1B2B4B">${ranked.length}</div><div class="sl2">Total</div></div>
+      <div><div class="sn" style="color:#1B7A4A">${strong.length}</div><div class="sl2">Strong Fit</div></div>
+      <div><div class="sn" style="color:#9B6C1A">${possible.length}</div><div class="sl2">Possible Fit</div></div>
     </div>
   </div>
-
   ${sectionHTML('Strong Fit', strong, 1)}
   ${sectionHTML('Possible Fit', possible, strong.length + 1)}
 </div>
-
 <script>
-  const CORRECT_PW = ${JSON.stringify(RANKING_PASSWORD)};
-  const STORAGE_KEY = 'ss_ranking_auth';
-
-  function checkAuth() {
-    const val = document.getElementById('pw-input').value;
-    if (val === CORRECT_PW) {
-      localStorage.setItem(STORAGE_KEY, '1');
-      document.getElementById('auth-overlay').style.display = 'none';
-      document.getElementById('main-content').style.display = 'block';
-    } else {
-      document.getElementById('auth-error').style.display = 'block';
-    }
-  }
-
-  // Auto-auth if previously authenticated
-  if (localStorage.getItem(STORAGE_KEY) === '1') {
-    document.getElementById('auth-overlay').style.display = 'none';
-    document.getElementById('main-content').style.display = 'block';
-  }
-
-  function toggleCard(card) {
-    card.classList.toggle('open');
-  }
-
-  function toggleSection(header) {
-    header.classList.toggle('collapsed');
-    const body = header.nextElementSibling;
-    body.classList.toggle('hidden');
-  }
-
-  // CSV export
-  const ranked = ${JSON.stringify(ranked)};
-  function exportCSV() {
-    const headers = ['Rank','Name','Score','Tier','Function & Level','Location','Seniority','Player/Coach','Company Stage','GTM','Availability','Comp Context','Deal Size','Tech Fluency','Industry','Reason for Looking','Headline','Strengths','Gaps','Metaview Link'];
-    const rows = ranked.map((r, i) => [
-      i+1, r.name, r.score, r.tier,
-      r.functionLevel??'', r.location??'', r.seniority??'',
-      r.playerCoach??'', r.companyStage??'', r.gtm??'',
-      r.availability??'', r.compContext??'', r.dealSize??'',
-      r.techFluency??'', r.industry??'', r.reasonForLooking??'',
-      '"'+(r.headline??'').replace(/"/g,'""')+'"',
-      '"'+(r.strengths??[]).join('; ').replace(/"/g,'""')+'"',
-      '"'+(r.gaps??[]).join('; ').replace(/"/g,'""')+'"',
-      r.url??''
-    ]);
-    const csv = [headers, ...rows].map(r => r.join(',')).join('\\n');
-    const blob = new Blob([csv], {type:'text/csv'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'candidate-ranking.csv'; a.click();
-    URL.revokeObjectURL(url);
-  }
+const PW=${JSON.stringify(RANKING_PASSWORD)};
+const SK='ss_auth';
+function auth(){const v=document.getElementById('pw').value;if(v===PW){localStorage.setItem(SK,'1');document.getElementById('ao').style.display='none';document.getElementById('mc').style.display='block';}else{document.getElementById('ae').style.display='block';}}
+if(localStorage.getItem(SK)==='1'){document.getElementById('ao').style.display='none';document.getElementById('mc').style.display='block';}
+function toggleCard(c){c.classList.toggle('open');}
+function toggleSection(h){h.classList.toggle('collapsed');h.nextElementSibling.classList.toggle('hidden');}
+const ranked=${JSON.stringify(ranked)};
+function exportCSV(){
+  const h=['Rank','Name','Score','Tier','Function & Level','Seniority','Player/Coach','Company Stage','GTM','Deal Size','Tech Fluency','Industry','Headline','Strengths','Gaps','Link'];
+  const r=ranked.map((c,i)=>[i+1,c.name,c.score,c.tier,c.functionLevel??'',c.seniority??'',c.playerCoach??'',c.companyStage??'',c.gtm??'',c.dealSize??'',c.techFluency??'',c.industry??'','"'+(c.headline??'').replace(/"/g,'""')+'"','"'+(c.strengths??[]).join('; ').replace(/"/g,'""')+'"','"'+(c.gaps??[]).join('; ').replace(/"/g,'""')+'"',c.url??'']);
+  const csv=[h,...r].map(x=>x.join(',')).join('\n');
+  const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='ranking.csv';a.click();URL.revokeObjectURL(u);
+}
 </script>
 </body>
 </html>`;
 }
 
-// ── Slack Bolt ────────────────────────────────────────────────────────────────
-const receiver = new ExpressReceiver({ signingSecret: SLACK_SIGNING_SECRET, endpoints: '/slack/events' });
-const slackApp = new App({ token: SLACK_BOT_TOKEN, receiver });
-
-slackApp.command('/rank-candidates', async ({ ack, body, client }) => {
-  await ack();
-  await client.views.open({
-    trigger_id: body.trigger_id,
-    view: {
-      type: 'modal',
-      callback_id: 'rank_candidates_modal',
-      private_metadata: JSON.stringify({ channel_id: body.channel_id }),
-      title: { type: 'plain_text', text: 'Rank Candidates' },
-      submit: { type: 'plain_text', text: 'Run Ranking' },
-      close: { type: 'plain_text', text: 'Cancel' },
-      blocks: [
-        {
-          type: 'input', block_id: 'jd_block',
-          label: { type: 'plain_text', text: 'Job Description or Scorecard' },
-          element: { type: 'plain_text_input', action_id: 'jd_input', multiline: true, placeholder: { type: 'plain_text', text: 'Paste the job description, scorecard, or key criteria here…' } },
-          hint: { type: 'plain_text', text: 'The more specific, the better the ranking.' },
-        },
-      ],
-    },
-  });
-});
-
-slackApp.view('rank_candidates_modal', async ({ ack, body, view, client }) => {
-  await ack();
-  const jd = view.state.values.jd_block.jd_input.value;
-  const { channel_id } = JSON.parse(view.private_metadata ?? '{}');
-  const userId = body.user.id;
-  const target = channel_id || userId;
-
-  setImmediate(async () => {
-    let holdingTs;
-    try {
-      const holding = await client.chat.postMessage({ channel: target, text: '⏳ Fetching candidates and running ranking… this usually takes 1–2 minutes. I\'ll post the link when it\'s ready.' });
-      holdingTs = holding.ts;
-    } catch (e) { console.error('Holding message failed:', e.message); }
-
-    try {
-      const result = await fetchAndRankCandidates(jd);
-      const ranked = result.ranked.sort((a, b) => b.score - a.score);
-
-      // Save to Redis
-      const id = crypto.randomBytes(8).toString('hex');
-      const jdSnippet = jd.length > 100 ? jd.slice(0, 100) + '…' : jd;
-      await saveRanking(id, { jdSnippet, createdAt: new Date().toISOString(), ranked });
-
-      const url = `${PUBLIC_URL}/ranking/${id}`;
-      const strong   = ranked.filter(r => r.tier === 'Strong Fit').length;
-      const possible = ranked.filter(r => r.tier === 'Possible Fit').length;
-
-      const blocks = [
-        { type: 'header', text: { type: 'plain_text', text: '✅ Candidate Ranking Ready', emoji: true } },
-        { type: 'section', text: { type: 'mrkdwn', text: `*${ranked.length} qualifying candidates* found against:\n_${jdSnippet}_` } },
-        { type: 'section', fields: [
-          { type: 'mrkdwn', text: `*🟢 Strong Fit*\n${strong} candidates` },
-          { type: 'mrkdwn', text: `*🟡 Possible Fit*\n${possible} candidates` },
-        ]},
-        { type: 'section', text: { type: 'mrkdwn', text: `*<${url}|View Full Ranking →>*\n_Link expires in 30 days · Team password required_` } },
-      ];
-
-      if (holdingTs) {
-        await client.chat.update({ channel: target, ts: holdingTs, text: `Ranking complete. View at ${url}`, blocks });
-      } else {
-        await client.chat.postMessage({ channel: target, text: `Ranking complete. View at ${url}`, blocks });
-      }
-    } catch (err) {
-      console.error('Ranking error:', err);
-      const errMsg = `❌ Ranking failed: ${err.message ?? 'Unknown error'}`;
-      if (holdingTs) { await client.chat.update({ channel: target, ts: holdingTs, text: errMsg }); }
-      else { await client.chat.postMessage({ channel: target, text: errMsg }); }
-    }
-  });
-});
-
-// ── Express routes ────────────────────────────────────────────────────────────
-const expressApp = receiver.app;
-expressApp.use(express.json());
-
-// Hosted ranking page
-expressApp.get('/ranking/:id', async (req, res) => {
-  try {
-    const data = await getRanking(req.params.id);
-    if (!data) return res.status(404).send('<h2>Ranking not found or expired.</h2>');
-    res.set('Content-Type', 'text/html').send(buildRankingHTML(data));
-  } catch (e) {
-    console.error('Ranking fetch error:', e);
-    res.status(500).send('<h2>Error loading ranking.</h2>');
-  }
-});
-
-// Chrome extension proxy
-expressApp.post('/company-info', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const data = JSON.stringify(req.body);
-  const apiReq = https.request(
-    { hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' } },
-    (apiRes) => { let buf = ''; apiRes.on('data', c => buf += c); apiRes.on('end', () => res.status(apiRes.statusCode).set('Content-Type', 'application/json').send(buf)); }
-  );
-  apiReq.on('error', e => res.status(500).json({ error: e.message }));
-  apiReq.write(data); apiReq.end();
-});
-
-// DNP list
-expressApp.get('/dnp-list', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  try { res.set('Content-Type', 'text/plain').send(fs.readFileSync(path.join(__dirname, 'dnp.csv'), 'utf8')); }
-  catch (e) { res.status(500).json({ error: 'Could not read DNP list' }); }
-});
-
-// CORS preflight
-expressApp.options('*', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.sendStatus(204);
-});
-
 // ── Start ─────────────────────────────────────────────────────────────────────
 (async () => {
-  await slackApp.start(PORT);
-  console.log(`Server running on port ${PORT}`);
+  await slackApp.start();
+  console.log('CandiBot is running (Socket Mode)');
 })();
