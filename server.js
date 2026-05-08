@@ -235,18 +235,35 @@ async function handleLookup(say, userId, entities, session) {
   await say(`_Looking up ${name} in Metaview..._`);
 
   try {
-    // Search for the candidate by name
+    // Step 1: resolve name to participant UUID via list_field_values
+    const fieldValues = await metaviewCall('list_field_values', {
+      field_id: 'default:candidate',
+      report_id: REPORT_ID,
+      search_term: name
+    });
+
+    if (!fieldValues?.values?.length) {
+      await say(`I couldn't find anyone named *${name}* in the Candidate Interviews report. Double-check the spelling or try a partial name.`);
+      return;
+    }
+
+    // Use the first match — pick the closest name if multiple
+    const match = fieldValues.values[0];
+    const candidateUUID = match.value;
+    const resolvedName = match.label ?? name;
+
+    // Step 2: fetch conversations for that candidate
     const result = await metaviewCall('search_conversations', {
       report_id: REPORT_ID,
       fields: [...FIELD_IDS, 'default:start_time', 'default:interviewer'],
-      filters: [{ field_id: 'default:candidate', operation: 'like_one_of', value: [name] }],
+      filters: [{ field_id: 'default:candidate', operation: 'includes_one_of', value: [candidateUUID] }],
       limit: 5,
       sort_by: 'default:start_time',
       sort_ascending: false
     });
 
     if (!result?.conversations?.length) {
-      await say(`I couldn't find anyone named *${name}* in the Candidate Interviews report. Double-check the spelling or try a partial name.`);
+      await say(`Found *${resolvedName}* in the database but couldn't load their interviews. Try again in a moment.`);
       return;
     }
 
@@ -255,7 +272,7 @@ async function handleLookup(say, userId, entities, session) {
 
     // Build a summary using Claude
     const profiles = convs.map(c => ({
-      name: getVal(c, 'default:candidate'),
+      name: getVal(c, 'default:candidate') ?? resolvedName,
       date: c.fields?.['default:start_time']?.[0]?.label,
       interviewer: getVal(c, 'default:interviewer'),
       functionLevel: getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
@@ -288,7 +305,7 @@ async function handleLookup(say, userId, entities, session) {
       blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_${convs.length} interviews on file. Showing most recent._` }] });
     }
 
-    await say({ text: `Found ${name}`, blocks });
+    await say({ text: `Found ${resolvedName}`, blocks });
 
   } catch (err) {
     console.error('Lookup error:', err);
