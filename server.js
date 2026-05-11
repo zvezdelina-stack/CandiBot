@@ -103,6 +103,7 @@ const INTENTS = {
   SUMMARIZE:  'summarize',  // "summarize the last 5 sales calls"
   HELP:       'help',       // "help" / "what can you do"
   RESET:      'reset',      // "start over" / "reset"
+  DEEPER:     'deeper',     // "search deeper" / "look further back"
   UNKNOWN:    'unknown',
 };
 
@@ -120,6 +121,7 @@ Intents:
 - summarize: user wants a summary of conversations or a candidate
 - help: user wants to know what the bot can do
 - reset: user wants to clear context and start fresh
+- deeper: user wants to search further back in the candidate database after a find query (e.g. "search deeper", "look further back", "check older candidates")
 - unknown: none of the above
 
 Entities to extract:
@@ -178,10 +180,10 @@ async function metaviewCall(toolName, params) {
 }
 
 // Fetch all candidates matching filters, paginating server-side
-async function fetchCandidates(filters) {
+async function fetchCandidates(filters, maxPages = Infinity) {
   let all = [], offset = 0, hasMore = true, page = 0;
 
-  while (hasMore) {
+  while (hasMore && page < maxPages) {
     page++;
     console.log(`Fetching page ${page} (offset ${offset})...`);
 
@@ -402,7 +404,7 @@ Example output: [{"field_id": "AI:b04c164c-49be-11f1-9b23-674021cd80ae", "operat
     if (!filterMatch) throw new Error('Could not parse filters from criteria');
     const filters = JSON.parse(filterMatch[0]);
 
-    const candidates = await fetchCandidates(filters);
+    const candidates = await fetchCandidates(filters, 2); // Cap at 100 candidates for sourcing speed
 
     if (!candidates.length) {
       await say(`No candidates found matching "${criteria}" in the last 24 months.`);
@@ -461,7 +463,7 @@ Only include candidates with score >= 60. Maximum 8 candidates. Be selective and
 
     const blocks = [
       { type: 'header', text: { type: 'plain_text', text: `🔍 Top matches for: ${criteria.slice(0, 60)}`, emoji: true } },
-      { type: 'context', elements: [{ type: 'mrkdwn', text: `${topMatches.length} candidates found from ${candidates.length} screened` }] },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: `${topMatches.length} matches from the ${candidates.length} most recent candidates · _Say "search deeper" to look further back_` }] },
       { type: 'divider' },
     ];
 
@@ -564,6 +566,105 @@ Question: ${message}`
   await say(answer);
 }
 
+// ── Deeper search handler ────────────────────────────────────────────────────
+async function handleDeeper(say, userId, session) {
+  const criteria = session.lastSearch;
+  if (!criteria) {
+    await say("No recent search to go deeper on. What are you looking for?");
+    return;
+  }
+
+  await say(`_Searching deeper for "${criteria}"..._`);
+
+  try {
+    const filterRes = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 400,
+      system: `You translate recruiter search criteria into Metaview filter arrays. Return ONLY a JSON array of filter objects.
+Available filters:
+- Primary Function: field_id "AI:b04c164c-49be-11f1-9b23-674021cd80ae", operation "is_one_of", values from: ["Sales", "Marketing", "Product", "Engineering", "Operations", "Customer Success", "People / HR", "Data / Analytics", "General Management"]
+- Date: field_id "default:start_time", operation "after", value {"scope": "relative", "value": -63072000}
+Always include the date filter.`,
+      messages: [{ role: 'user', content: criteria }]
+    });
+
+    const filterText = filterRes.content.find(b => b.type === 'text')?.text ?? '';
+    const filterMatch = filterText.match(/\[[\s\S]*\]/);
+    if (!filterMatch) throw new Error('Could not parse filters');
+    const filters = JSON.parse(filterMatch[0]);
+
+    // Fetch pages 3-6 (candidates 101-300) — skipping what was already shown
+    const allCandidates = await fetchCandidates(filters, 6);
+    const deeperCandidates = allCandidates.slice(100); // Skip first 100 already shown
+
+    if (!deeperCandidates.length) {
+      await say("No additional candidates found beyond what was already shown.");
+      return;
+    }
+
+    const profiles = deeperCandidates.map((c, i) => ({
+      index: i,
+      name: getVal(c, 'default:candidate') ?? `Candidate ${i+1}`,
+      url: c.url,
+      functionLevel:   getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
+      seniority:       getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+      leadershipScope: getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
+      gtm:             getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+      companyStage:    getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+      industry:        getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
+      dealSize:        getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
+      techFluency:     getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+      location:        getVal(c, 'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de'),
+    }));
+
+    const res = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 4000,
+      system: `Find the top candidates matching search criteria from an older pool. Return ONLY valid JSON.
+Output: {"matches": [{"index": <n>, "score": <0-100>, "reason": "<one sentence>"}]}
+Only include candidates with score >= 60. Maximum 8 candidates.`,
+      messages: [{ role: 'user', content: `SEARCH: ${criteria}
+
+CANDIDATES: ${JSON.stringify(profiles.slice(0, 80), null, 2)}` }]
+    });
+
+    const text = res.content.find(b => b.type === 'text')?.text ?? '';
+    const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
+    if (!match) { await say("No additional matches found in the deeper search."); return; }
+
+    const parsed = JSON.parse(match[0]);
+    const topMatches = (parsed.matches ?? []).sort((a, b) => b.score - a.score).slice(0, 8);
+
+    if (!topMatches.length) {
+      await say(`No additional matches found beyond the initial results.`);
+      return;
+    }
+
+    const blocks = [
+      { type: 'header', text: { type: 'plain_text', text: `🔍 Deeper results: ${criteria.slice(0, 50)}`, emoji: true } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: `${topMatches.length} additional matches from older candidates` }] },
+      { type: 'divider' },
+    ];
+
+    topMatches.forEach((m, i) => {
+      const p = profiles[m.index];
+      if (!p) return;
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: `*${i+1}. ${p.url ? `<${p.url}|${p.name}>` : p.name}*${p.functionLevel ? `  ·  ${p.functionLevel}` : ''}
+${m.reason}` }
+      });
+      if (i < topMatches.length - 1) blocks.push({ type: 'divider' });
+    });
+
+    await say({ text: `Found ${topMatches.length} deeper matches`, blocks });
+
+  } catch (err) {
+    console.error('Deeper search error:', err);
+    await say(`Something went wrong: ${err.message}`);
+  }
+}
+
 // ── Main message router ───────────────────────────────────────────────────────
 async function routeMessage(say, userId, text) {
   // Load session
@@ -575,6 +676,9 @@ async function routeMessage(say, userId, text) {
 
   // Route to handler
   switch (intent) {
+    case INTENTS.DEEPER:
+      await handleDeeper(say, userId, session);
+      break;
     case INTENTS.FOLLOWUP:
       await handleFollowup(say, userId, text, session);
       break;
