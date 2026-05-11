@@ -347,8 +347,14 @@ async function handleLookup(say, userId, entities, session) {
     await say({ text: `Found ${resolvedName}`, blocks });
 
   } catch (err) {
-    console.error('Lookup error:', err);
-    await say(`Something went wrong looking up ${name}. Check Railway logs for details.`);
+    console.error('Lookup error full:', err?.message ?? err);
+    console.error('Lookup error stack:', err?.stack);
+    if (err?.status === 429) {
+      const retryAfter = parseInt(err.headers?.['retry-after'] ?? '60', 10);
+      await say(`I'm hitting API rate limits. Try again in about ${Math.ceil(retryAfter / 60)} minute(s).`);
+    } else {
+      await say(`Something went wrong looking up ${name}: ${err?.message ?? 'unknown error'}`);
+    }
   }
 }
 
