@@ -58,6 +58,7 @@ const FIELD_IDS = [
   'AI:ffcd1fa4-49be-11f1-a302-239193bb599f', // Industry
   'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9', // Deal Size
   'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915', // Tech Fluency
+  'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de', // Location
 ];
 
 // ── Session management ────────────────────────────────────────────────────────
@@ -293,18 +294,24 @@ async function handleLookup(say, userId, entities, session) {
 
     // Build a summary using Claude
     const profiles = convs.map(c => ({
-      name: getVal(c, 'default:candidate') ?? resolvedName,
-      date: c.fields?.['default:start_time']?.[0]?.label,
-      interviewer: getVal(c, 'default:interviewer'),
-      functionLevel: getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
-      seniority: getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
-      playerCoach: getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
-      leadershipScope: getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
-      gtm: getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
-      companyStage: getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
-      industry: getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
-      dealSize: getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
-      techFluency: getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+      name:             getVal(c, 'default:candidate') ?? resolvedName,
+      date:             c.fields?.['default:start_time']?.[0]?.label,
+      interviewer:      getVal(c, 'default:interviewer'),
+      functionLevel:    getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
+      seniority:        getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+      playerCoach:      getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
+      leadershipScope:  getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
+      gtm:              getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+      companyStage:     getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+      industry:         getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
+      dealSize:         getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
+      techFluency:      getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+      crossFunctional:  getVal(c, 'AI:b76395ae-49be-11f1-b7cc-27718543b130'),
+      compContext:      getVal(c, 'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042'),
+      compExpectations: getVal(c, 'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2'),
+      availability:     getVal(c, 'AI:e07de6f6-49be-11f1-a6c6-2f3b4b019285'),
+      reasonForLooking: getVal(c, 'AI:07343c46-49bf-11f1-ac1a-dbf22856edfb'),
+      location:         getVal(c, 'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de'),
       url: c.url,
     }));
 
