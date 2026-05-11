@@ -756,6 +756,67 @@ slackApp.command('/candibot-help', async ({ ack, say }) => {
 const expressApp = express();
 expressApp.use(express.json());
 
+// ── CORS ── allow Claude.ai artifact to call these endpoints ──────────────────
+expressApp.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// ── Metaview proxy: fetch candidates page (no Claude API call) ────────────────
+expressApp.post('/fetch-candidates', async (req, res) => {
+  try {
+    const { filters = [], offset = 0, limit = 50 } = req.body;
+    const payload = JSON.stringify({
+      report_id: REPORT_ID,
+      fields: LOOKUP_FIELD_IDS,
+      filters: [
+        ...filters,
+        { field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }
+      ],
+      limit,
+      offset,
+      sort_by: 'default:start_time',
+      sort_ascending: false
+    });
+
+    const result = await new Promise((resolve, reject) => {
+      const r = https.request(
+        {
+          hostname: 'api.metaview.ai',
+          path: '/v1/conversations/search',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+            'Authorization': `Bearer ${METAVIEW_API_KEY}`,
+          }
+        },
+        (resp) => {
+          let buf = '';
+          resp.on('data', c => buf += c);
+          resp.on('end', () => {
+            try { resolve({ status: resp.statusCode, body: JSON.parse(buf) }); }
+            catch { resolve({ status: resp.statusCode, body: buf }); }
+          });
+        }
+      );
+      r.on('error', reject);
+      r.write(payload);
+      r.end();
+    });
+
+    console.log(`fetch-candidates: offset=${offset}, status=${result.status}, count=${result.body?.conversations?.length ?? 0}`);
+    res.status(result.status).json(result.body);
+  } catch (e) {
+    console.error('fetch-candidates error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Metaview proxy: save ranking from artifact ────────────────────────────────
 expressApp.get('/ranking/:id', async (req, res) => {
   try {
     const data = await getRanking(req.params.id);
