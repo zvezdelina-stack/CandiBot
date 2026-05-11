@@ -147,18 +147,19 @@ function getVal(conv, fieldId) {
 
 // Run a single Metaview MCP call via Claude and extract the tool result
 async function metaviewCall(toolName, params) {
-  const stream = await withRetry(() => anthropic.beta.messages.stream(
-    {
-      model: 'claude-sonnet-4-6',
-      max_tokens: 8192,
-      system: `You are a Metaview API proxy. Call the ${toolName} tool with EXACTLY the parameters provided. Return nothing else.`,
-      mcp_servers: MCP_SERVERS,
-      messages: [{ role: 'user', content: `Call ${toolName} with these parameters: ${JSON.stringify(params)}` }]
-    },
-    { headers: { 'anthropic-beta': 'mcp-client-2025-04-04' } }
-  ));
-
-  const final = await stream.finalMessage();
+  const final = await withRetry(async () => {
+    const stream = anthropic.beta.messages.stream(
+      {
+        model: 'claude-sonnet-4-6',
+        max_tokens: 8192,
+        system: `You are a Metaview API proxy. Call the ${toolName} tool with EXACTLY the parameters provided. Return nothing else.`,
+        mcp_servers: MCP_SERVERS,
+        messages: [{ role: 'user', content: `Call ${toolName} with these parameters: ${JSON.stringify(params)}` }]
+      },
+      { headers: { 'anthropic-beta': 'mcp-client-2025-04-04' } }
+    );
+    return stream.finalMessage();
+  });
   const mcpResults = final.content.filter(b => b.type === 'mcp_tool_result');
   const textBlocks = final.content.filter(b => b.type === 'text');
 
