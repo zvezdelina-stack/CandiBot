@@ -98,6 +98,7 @@ const INTENTS = {
   RANK:       'rank',       // "rank candidates for this VP Sales role"
   FIND:       'find',       // "find me engineers with fintech background"
   LOOKUP:     'lookup',     // "pull up John Smith" / "tell me about Sarah Lee"
+  FOLLOWUP:   'followup',   // "what was their comp?" / "tell me more about their GTM experience"
   SUMMARIZE:  'summarize',  // "summarize the last 5 sales calls"
   HELP:       'help',       // "help" / "what can you do"
   RESET:      'reset',      // "start over" / "reset"
@@ -114,6 +115,7 @@ Intents:
 - rank: user wants to rank/score candidates against a role or JD
 - find: user wants to search for candidates matching criteria
 - lookup: user wants info on a specific named candidate
+- followup: user is asking a follow-up question about the last candidate discussed (e.g. "what was their comp?", "what about their GTM experience?", "how much were they making?", "did they discuss availability?") — use this when there's a candidate in session context and no new name is mentioned
 - summarize: user wants a summary of conversations or a candidate
 - help: user wants to know what the bot can do
 - reset: user wants to clear context and start fresh
@@ -288,7 +290,12 @@ async function handleLookup(say, userId, entities, session) {
     }
 
     const convs = result.conversations;
-    await setSession(userId, { lastCandidate: name, lastCandidateConvs: convs.map(c => c.id) });
+    await setSession(userId, { 
+      lastCandidate: resolvedName,
+      lastCandidateUUID: candidateUUID,
+      lastCandidateConvs: convs.map(c => c.id),
+      lastCandidateProfile: { ...profiles[0], uuid: candidateUUID }
+    });
 
     // Build a summary using Claude
     const profiles = convs.map(c => ({
@@ -482,6 +489,65 @@ async function handleHelp(say) {
   });
 }
 
+// ── Follow-up question handler ───────────────────────────────────────────────
+async function handleFollowup(say, userId, message, session) {
+  const profile = session.lastCandidateProfile;
+  const name = session.lastCandidate;
+
+  if (!profile || !name) {
+    await say("I don't have a candidate in context. Who would you like to know more about?");
+    return;
+  }
+
+  // Also pull comp expectations field which isn't in the main FIELD_IDS
+  // Fetch it fresh if asked about comp
+  const isCompQuestion = /comp|salary|pay|compensation|making|earn|expectation/i.test(message);
+  let compData = null;
+
+  if (isCompQuestion) {
+    try {
+      const compResult = await metaviewCall('search_conversations', {
+        report_id: REPORT_ID,
+        fields: [
+          'default:candidate',
+          'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2', // Compensation Expectations
+          'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042', // Comp Context
+        ],
+        filters: [{ field_id: 'default:candidate', operation: 'includes_one_of', value: [profile.uuid ?? session.lastCandidateUUID] }],
+        limit: 1,
+        sort_by: 'default:start_time',
+        sort_ascending: false
+      });
+      if (compResult?.conversations?.[0]) {
+        const c = compResult.conversations[0];
+        compData = {
+          compExpectations: getVal(c, 'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2'),
+          compContext: getVal(c, 'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042'),
+        };
+      }
+    } catch (e) {
+      console.error('Comp fetch error:', e.message);
+    }
+  }
+
+  const profileWithComp = compData ? { ...profile, ...compData } : profile;
+
+  const res = await withRetry(() => anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 300,
+    system: `You are a recruiter's assistant at SwingSearch. Answer the specific question asked about a candidate using only the data provided. Be direct and concise — 1-3 sentences. If the data doesn't contain the answer, say so plainly without padding. Never mention client or employer names.`,
+    messages: [{
+      role: 'user',
+      content: `Candidate profile: ${JSON.stringify(profileWithComp)}
+
+Question: ${message}`
+    }]
+  }));
+
+  const answer = res.content.find(b => b.type === 'text')?.text ?? '';
+  await say(answer);
+}
+
 // ── Main message router ───────────────────────────────────────────────────────
 async function routeMessage(say, userId, text) {
   // Load session
@@ -493,6 +559,9 @@ async function routeMessage(say, userId, text) {
 
   // Route to handler
   switch (intent) {
+    case INTENTS.FOLLOWUP:
+      await handleFollowup(say, userId, text, session);
+      break;
     case INTENTS.RANK:
       await handleRank(say, userId, entities, session);
       break;
