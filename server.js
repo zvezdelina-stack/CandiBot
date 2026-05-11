@@ -500,7 +500,7 @@ async function handleHelp(say) {
       { type: 'divider' },
       { type: 'section', text: { type: 'mrkdwn', text: '*👤 Look up a candidate*\nGet a quick profile on anyone we\'ve screened.\n_"Pull up Indy Sen"_ or _"Tell me about Sarah Lee"_' } },
       { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*📊 Rank candidates*\nScore your full pipeline against a role or JD.\n_"Rank candidates for the VP Sales role at AmberBox"_\nI\'ll open the Claude ranker and post the results link here.' } },
+      { type: 'section', text: { type: 'mrkdwn', text: '*📊 Rank your pipeline*\nScore candidates against a job description or scorecard. Paste the full JD or key criteria and I\'ll open the Claude ranker — results post back here as a shareable link.\n_"Rank candidates for VP Sales at AmberBox"_\n_"Here\'s the scorecard: [paste]"_' } },
       { type: 'divider' },
       { type: 'context', elements: [{ type: 'mrkdwn', text: '_Say "reset" to clear context and start fresh._' }] },
     ]
