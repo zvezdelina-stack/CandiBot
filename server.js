@@ -322,7 +322,7 @@ async function handleLookup(say, userId, entities, session) {
       const summaryRes = await withRetry(() => anthropic.messages.create({
         model: 'claude-sonnet-4-6',
         max_tokens: 400,
-        system: `You are a recruiter's assistant at SwingSearch. Write a concise candidate profile for Slack — 3-5 sentences maximum. Lead with what makes them interesting or disqualifying. Be specific. No filler phrases like "not enough data" or lists of what's missing. Use only what's provided.`,
+        system: `You are a recruiter's assistant at SwingSearch. Write a concise candidate profile — 3-5 sentences maximum. Lead with what makes them interesting or disqualifying. Be specific. Use only what's provided in the data. NEVER mention a client company name, hiring company, or speculate about fit for any specific role or employer — you don't know what search this is for.`,
         messages: [{ role: 'user', content: `Summarize: ${JSON.stringify(p)}` }]
       }));
       summary = summaryRes.content.find(b => b.type === 'text')?.text ?? '';
