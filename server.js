@@ -307,14 +307,26 @@ async function handleLookup(say, userId, entities, session) {
       url: c.url,
     }));
 
-    const summaryRes = await withRetry(() => anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 600,
-      system: `You are a recruiter's assistant at SwingSearch. Summarize a candidate's profile concisely for a Slack message. Be specific and useful. Use plain text — no markdown headers, no bullet points with dashes. Keep it under 200 words. End with their Metaview link.`,
-      messages: [{ role: 'user', content: `Summarize this candidate: ${JSON.stringify(profiles[0])}` }]
-    }));
+    // Check if we have meaningful data to summarize
+    const p = profiles[0];
+    const filledFields = [p.functionLevel, p.seniority, p.playerCoach, p.leadershipScope, p.gtm, p.companyStage, p.industry, p.dealSize, p.techFluency].filter(Boolean);
+    const hasData = filledFields.length >= 3;
 
-    const summary = summaryRes.content.find(b => b.type === 'text')?.text ?? '';
+    let summary;
+    if (!hasData) {
+      // Not enough AI field data — give a direct response without padding
+      const interviewedBy = p.interviewer ? ` with ${p.interviewer}` : '';
+      const interviewDate = p.date ? ` on ${p.date}` : '';
+      summary = `Interviewed${interviewedBy}${interviewDate}. Profile fields haven't been analyzed yet — this is likely a recent interview. Review the full recording for details.`;
+    } else {
+      const summaryRes = await withRetry(() => anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 400,
+        system: `You are a recruiter's assistant at SwingSearch. Write a concise candidate profile for Slack — 3-5 sentences maximum. Lead with what makes them interesting or disqualifying. Be specific. No filler phrases like "not enough data" or lists of what's missing. Use only what's provided.`,
+        messages: [{ role: 'user', content: `Summarize: ${JSON.stringify(p)}` }]
+      }));
+      summary = summaryRes.content.find(b => b.type === 'text')?.text ?? '';
+    }
 
     const blocks = [
       { type: 'section', text: { type: 'mrkdwn', text: `*${profiles[0].name ?? name}*${profiles[0].functionLevel ? `  ·  ${profiles[0].functionLevel}` : ''}` } },
