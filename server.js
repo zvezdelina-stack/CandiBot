@@ -771,7 +771,7 @@ expressApp.post('/fetch-candidates', async (req, res) => {
     const { filters = [], offset = 0, limit = 50 } = req.body;
     const payload = JSON.stringify({
       report_id: REPORT_ID,
-      fields: LOOKUP_FIELD_IDS,
+      fields: FIELD_IDS,
       filters: [
         ...filters,
         { field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }
