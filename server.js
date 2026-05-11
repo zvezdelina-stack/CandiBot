@@ -339,7 +339,7 @@ async function handleLookup(say, userId, entities, session) {
       const summaryRes = await withRetry(() => anthropic.messages.create({
         model: 'claude-sonnet-4-6',
         max_tokens: 400,
-        system: `You are a recruiter's assistant at SwingSearch. Write a concise candidate profile — 3-5 sentences maximum. Lead with what makes them interesting or disqualifying. Be specific. Use only what's provided in the data. NEVER mention a client company name, hiring company, or speculate about fit for any specific role or employer. IMPORTANT: Before saying any field "was not captured" or "not discussed", check ALL fields in the data including compExpectations, compContext, availability, location, and reasonForLooking — if any of these have a value, do not say they are missing. Only mention gaps for fields that are genuinely null or empty.`,
+        system: `You are a recruiter's assistant at SwingSearch. Write a concise candidate profile — 3-5 sentences maximum. Lead with what makes them interesting or disqualifying. Be specific and direct. Use only what's provided in the data. NEVER mention missing fields, gaps in data, or anything that "was not captured" or "not discussed" — only speak to what you know. NEVER mention a client company name, hiring company, or speculate about fit for any specific role or employer.`,
         messages: [{ role: 'user', content: `Summarize: ${JSON.stringify(p)}` }]
       }));
       summary = summaryRes.content.find(b => b.type === 'text')?.text ?? '';
