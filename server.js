@@ -290,12 +290,6 @@ async function handleLookup(say, userId, entities, session) {
     }
 
     const convs = result.conversations;
-    await setSession(userId, { 
-      lastCandidate: resolvedName,
-      lastCandidateUUID: candidateUUID,
-      lastCandidateConvs: convs.map(c => c.id),
-      lastCandidateProfile: { ...profiles[0], uuid: candidateUUID }
-    });
 
     // Build a summary using Claude
     const profiles = convs.map(c => ({
@@ -316,6 +310,15 @@ async function handleLookup(say, userId, entities, session) {
 
     // Check if we have meaningful data to summarize
     const p = profiles[0];
+
+    // Save to session now that profiles is defined
+    await setSession(userId, {
+      lastCandidate: resolvedName,
+      lastCandidateUUID: candidateUUID,
+      lastCandidateConvs: convs.map(c => c.id),
+      lastCandidateProfile: { ...p, uuid: candidateUUID }
+    });
+
     const filledFields = [p.functionLevel, p.seniority, p.playerCoach, p.leadershipScope, p.gtm, p.companyStage, p.industry, p.dealSize, p.techFluency].filter(Boolean);
     const hasData = filledFields.length >= 3;
 
