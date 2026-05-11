@@ -22,6 +22,25 @@ const PORT                   = process.env.PORT || 8080;
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
 
+// ── Retry wrapper ────────────────────────────────────────────────────────────
+async function withRetry(fn, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isRateLimit = err.status === 429;
+      const retryAfter = parseInt(err.headers?.['retry-after'] ?? '10', 10);
+      if (isRateLimit && attempt < maxAttempts) {
+        const wait = (retryAfter + 2) * 1000;
+        console.log(`Rate limited. Waiting ${retryAfter + 2}s before retry ${attempt + 1}/${maxAttempts}...`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 const REPORT_ID = '61729db2-3946-11f1-b952-fb44be0b5cdb';
 const RANKING_TTL  = 30 * 24 * 60 * 60; // 30 days in seconds
@@ -128,7 +147,7 @@ function getVal(conv, fieldId) {
 
 // Run a single Metaview MCP call via Claude and extract the tool result
 async function metaviewCall(toolName, params) {
-  const stream = await anthropic.beta.messages.stream(
+  const stream = await withRetry(() => anthropic.beta.messages.stream(
     {
       model: 'claude-sonnet-4-6',
       max_tokens: 8192,
@@ -137,7 +156,7 @@ async function metaviewCall(toolName, params) {
       messages: [{ role: 'user', content: `Call ${toolName} with these parameters: ${JSON.stringify(params)}` }]
     },
     { headers: { 'anthropic-beta': 'mcp-client-2025-04-04' } }
-  );
+  ));
 
   const final = await stream.finalMessage();
   const mcpResults = final.content.filter(b => b.type === 'mcp_tool_result');
@@ -287,12 +306,12 @@ async function handleLookup(say, userId, entities, session) {
       url: c.url,
     }));
 
-    const summaryRes = await anthropic.messages.create({
+    const summaryRes = await withRetry(() => anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 600,
       system: `You are a recruiter's assistant at SwingSearch. Summarize a candidate's profile concisely for a Slack message. Be specific and useful. Use plain text — no markdown headers, no bullet points with dashes. Keep it under 200 words. End with their Metaview link.`,
       messages: [{ role: 'user', content: `Summarize this candidate: ${JSON.stringify(profiles[0])}` }]
-    });
+    }));
 
     const summary = summaryRes.content.find(b => b.type === 'text')?.text ?? '';
 
@@ -514,7 +533,12 @@ slackApp.message(async ({ message, say }) => {
     await routeMessage(say, message.user, text);
   } catch (err) {
     console.error('Message handler error:', err);
-    await say("Something went wrong on my end. Try again in a moment.");
+    if (err.status === 429) {
+      const retryAfter = parseInt(err.headers?.['retry-after'] ?? '60', 10);
+      await say(`I'm hitting API rate limits right now. Try again in about ${Math.ceil(retryAfter / 60)} minute(s).`);
+    } else {
+      await say("Something went wrong on my end. Try again in a moment.");
+    }
   }
 });
 
