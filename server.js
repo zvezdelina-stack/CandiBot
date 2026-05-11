@@ -207,7 +207,7 @@ async function fetchCandidates(filters, maxPages = Infinity) {
     offset += result.conversations.length;
     console.log(`Page ${page}: +${result.conversations.length}, total: ${all.length}, has_more: ${hasMore}`);
 
-    if (hasMore) await new Promise(r => setTimeout(r, 2000));
+    // No delay for sourcing queries — speed matters more than rate limit caution here
   }
 
   return all;
@@ -404,7 +404,7 @@ Example output: [{"field_id": "AI:b04c164c-49be-11f1-9b23-674021cd80ae", "operat
     if (!filterMatch) throw new Error('Could not parse filters from criteria');
     const filters = JSON.parse(filterMatch[0]);
 
-    const candidates = await fetchCandidates(filters, 2); // Cap at 100 candidates for sourcing speed
+    const candidates = await fetchCandidates(filters, 10); // Cap at 500 candidates for sourcing
 
     if (!candidates.length) {
       await say(`No candidates found matching "${criteria}" in the last 24 months.`);
@@ -594,8 +594,8 @@ Always include the date filter.`,
     const filters = JSON.parse(filterMatch[0]);
 
     // Fetch pages 3-6 (candidates 101-300) — skipping what was already shown
-    const allCandidates = await fetchCandidates(filters, 6);
-    const deeperCandidates = allCandidates.slice(100); // Skip first 100 already shown
+    const allCandidates = await fetchCandidates(filters, 20);
+    const deeperCandidates = allCandidates.slice(500); // Skip first 500 already shown
 
     if (!deeperCandidates.length) {
       await say("No additional candidates found beyond what was already shown.");
