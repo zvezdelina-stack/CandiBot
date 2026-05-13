@@ -765,6 +765,11 @@ expressApp.use((req, res, next) => {
   next();
 });
 
+// ── Metaview token endpoint — used by Claude artifact ────────────────────────
+expressApp.get('/metaview-token', (req, res) => {
+  res.json({ token: METAVIEW_API_KEY });
+});
+
 // ── Metaview proxy: fetch candidates page (no Claude API call) ────────────────
 expressApp.post('/fetch-candidates', async (req, res) => {
   try {
