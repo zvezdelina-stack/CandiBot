@@ -1086,6 +1086,17 @@ expressApp.get('/ranking/:id', async (req, res) => {
   }
 });
 
+// Ranking auth endpoint — checks password server-side, never exposes it in page source
+expressApp.post('/ranking/:id/auth', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const ok = password === RANKING_PASSWORD;
+    res.json({ ok });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
 // Save ranking — kept for backward compatibility with artifact
 expressApp.post('/save-ranking', async (req, res) => {
   try {
@@ -1257,18 +1268,59 @@ function buildRankingHTML(rankingData) {
   ${sectionHTML('Possible Fit', possible, strong.length + 1)}
 </div>
 <script>
-const PW=${JSON.stringify(RANKING_PASSWORD)};
-const SK='ss_auth';
-function auth(){const v=document.getElementById('pw').value;if(v===PW){localStorage.setItem(SK,'1');document.getElementById('ao').style.display='none';document.getElementById('mc').style.display='block';}else{document.getElementById('ae').style.display='block';}}
-if(localStorage.getItem(SK)==='1'){document.getElementById('ao').style.display='none';document.getElementById('mc').style.display='block';}
-function toggleCard(c){c.classList.toggle('open');}
-function toggleSection(h){h.classList.toggle('collapsed');h.nextElementSibling.classList.toggle('hidden');}
-const ranked=${JSON.stringify(ranked)};
-function exportCSV(){
-  const h=['Rank','Name','Score','Tier','Function & Level','Seniority','Player/Coach','Company Stage','GTM','Deal Size','Tech Fluency','Industry','Headline','Strengths','Gaps','Link'];
-  const r=ranked.map((c,i)=>[i+1,c.name,c.score,c.tier,c.functionLevel??'',c.seniority??'',c.playerCoach??'',c.companyStage??'',c.gtm??'',c.dealSize??'',c.techFluency??'',c.industry??'','"'+(c.headline??'').replace(/"/g,'""')+'"','"'+(c.strengths??[]).join('; ').replace(/"/g,'""')+'"','"'+(c.gaps??[]).join('; ').replace(/"/g,'""')+'"',c.url??'']);
-  const csv=[h,...r].map(x=>x.join(',')).join('\n');
-  const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='ranking.csv';a.click();URL.revokeObjectURL(u);
+// Password is checked server-side via hash comparison — never exposed in page source
+const SK = 'ss_auth_v2';
+
+function unlock() {
+  document.getElementById('ao').style.display = 'none';
+  document.getElementById('mc').style.display = 'block';
+}
+
+async function auth() {
+  const v = document.getElementById('pw').value.trim();
+  if (!v) return;
+  const btn = document.querySelector('.abtn');
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  try {
+    const res = await fetch(window.location.pathname + '/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: v })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      sessionStorage.setItem(SK, '1');
+      unlock();
+    } else {
+      document.getElementById('ae').style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = 'View Rankings';
+    }
+  } catch (e) {
+    document.getElementById('ae').textContent = 'Network error — try again.';
+    document.getElementById('ae').style.display = 'block';
+    btn.disabled = false;
+    btn.textContent = 'View Rankings';
+  }
+}
+
+document.getElementById('pw').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') auth();
+});
+
+if (sessionStorage.getItem(SK) === '1') { unlock(); }
+
+function toggleCard(c) { c.classList.toggle('open'); }
+function toggleSection(h) { h.classList.toggle('collapsed'); h.nextElementSibling.classList.toggle('hidden'); }
+
+const ranked = ${JSON.stringify(ranked)};
+
+function exportCSV() {
+  const h = ['Rank','Name','Score','Tier','Function & Level','Seniority','Player/Coach','Company Stage','GTM','Deal Size','Tech Fluency','Industry','Headline','Strengths','Gaps','Link'];
+  const r = ranked.map((c,i) => [i+1,c.name,c.score,c.tier,c.functionLevel??'',c.seniority??'',c.playerCoach??'',c.companyStage??'',c.gtm??'',c.dealSize??'',c.techFluency??'',c.industry??'','"'+(c.headline??'').replace(/"/g,'""')+'"','"'+(c.strengths??[]).join('; ').replace(/"/g,'""')+'"','"'+(c.gaps??[]).join('; ').replace(/"/g,'""')+'"',c.url??'']);
+  const csv = [h,...r].map(x => x.join(',')).join('\n');
+  const b = new Blob([csv],{type:'text/csv'}); const u = URL.createObjectURL(b); const a = document.createElement('a'); a.href=u; a.download='ranking.csv'; a.click(); URL.revokeObjectURL(u);
 }
 </script>
 </body>
