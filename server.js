@@ -41,6 +41,23 @@ async function withRetry(fn, maxAttempts = 3) {
   }
 }
 
+// ── Safe JSON parse — strips control characters that break JSON.parse ───────────
+function safeParse(raw) {
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch {}
+  try {
+    // Strip unescaped control chars; preserve \n \r \t as proper escapes
+    const cleaned = raw.replace(/[\u0000-\u001F\u007F]/g, function(c) {
+      if (c === '\n') return '\\n';
+      if (c === '\r') return '\\r';
+      if (c === '\t') return '\\t';
+      return '';
+    });
+    return JSON.parse(cleaned);
+  } catch {}
+  return null;
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 const REPORT_ID   = '61729db2-3946-11f1-b952-fb44be0b5cdb';
 const RANKING_TTL = 30 * 24 * 60 * 60; // 30 days
@@ -250,8 +267,8 @@ async function runRankingJob(jobId, jd, role, company, slackUserId, slackSay) {
     const inferRes = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 100,
-      system: 'You map job descriptions to exactly one primary function from a fixed list based on the PRIMARY role being hired. A VP of Sales is Sales. A CMO is Marketing. A CTO is Engineering. Return ONLY the exact function name from the list, nothing else — no explanation, no punctuation.',
-      messages: [{ role: 'user', content: 'List:\n' + PRIMARY_FUNCTIONS.join('\n') + '\n\nWhat is the primary function of the role described below? Return only the function name.\n\n' + jd.slice(0, 2000) }]
+      system: 'You map job descriptions to exactly one primary function from a fixed list based on the PRIMARY role. Examples: VP of Sales → Sales. CMO → Marketing. Director of Product Marketing → Marketing. Head of Growth → Marketing. CTO → Engineering. Head of Product → Product. Return ONLY the exact function name from the list, nothing else — no explanation, no punctuation.',
+      messages: [{ role: 'user', content: 'List:\n' + PRIMARY_FUNCTIONS.join('\n') + '\n\nWhat is the primary function of the role described below? If the role spans multiple functions (e.g. "Product Marketing"), return the one that best reflects the TEAM the person would sit on. Return only the function name.\n\n' + jd.slice(0, 2000) }]
     });
     const inferRaw = inferRes.content.find(b => b.type === 'text')?.text?.trim() ?? '';
     const primaryFunction = PRIMARY_FUNCTIONS.find(f => inferRaw.toLowerCase().includes(f.toLowerCase())) ?? null;
@@ -292,13 +309,13 @@ async function runRankingJob(jobId, jd, role, company, slackUserId, slackSay) {
     const SCREEN_CHUNK = 200;
     const keepIndices = new Set();
 
-    for (let i = 0; i < slim.length; i += SCREEN_CHUNK) {
-      if (i > 0) await new Promise(r => setTimeout(r, 1000));
-      const chunk = slim.slice(i, i + SCREEN_CHUNK);
+    for (let ci = 0; ci < slim.length; ci += SCREEN_CHUNK) {
+      if (ci > 0) await new Promise(r => setTimeout(r, 1000));
+      const chunk = slim.slice(ci, ci + SCREEN_CHUNK);
       const screenRes = await anthropic.messages.create({
         model: 'claude-sonnet-4-6',
         max_tokens: 1000,
-        system: 'You are a recruiting screener. Return ONLY a JSON object {"keep":[...indices...]} of candidates worth deeper evaluation. Be inclusive — exclude only obvious mismatches (wrong seniority level, irrelevant stage). No other text.',
+        system: 'You are a recruiting screener. Return ONLY a JSON object {"keep":[...indices...]} of candidates worth deeper evaluation. Be inclusive — when in doubt, keep. Exclude only obvious mismatches (e.g. clearly junior IC when role needs VP). No other text.',
         messages: [{ role: 'user', content: `JD:\n${jd.slice(0, 1500)}\n\nCANDIDATES:\n${JSON.stringify(chunk)}` }]
       });
       const screenText = screenRes.content.find(b => b.type === 'text')?.text ?? '';
@@ -306,12 +323,17 @@ async function runRankingJob(jobId, jd, role, company, slackUserId, slackSay) {
       if (screenMatch) {
         try {
           const parsed = JSON.parse(screenMatch[0]);
-          (parsed.keep ?? []).forEach(localIdx => keepIndices.add(i + localIdx));
-        } catch {}
+          // localIdx is relative to this chunk; add ci to get absolute index
+          (parsed.keep ?? []).forEach(localIdx => keepIndices.add(ci + localIdx));
+        } catch (e) {
+          console.error(`[job:${jobId}] Screen parse error at offset ${ci}:`, e.message);
+        }
       }
     }
 
+    // If screen returned nothing, skip screening and rank everything
     const screened = keepIndices.size > 0 ? candidates.filter((_, i) => keepIndices.has(i)) : candidates;
+    console.log(`[job:${jobId}] Screen kept ${keepIndices.size} of ${candidates.length} (${keepIndices.size === 0 ? 'fallback: ranking all' : 'filtered'});`);
     console.log(`[job:${jobId}] Screened to ${screened.length} candidates`);
 
     // Stage 4: full ranking
@@ -362,10 +384,18 @@ Scoring: 80-100 Strong Fit, 50-79 Possible Fit, 0-49 Not a Fit. Be opinionated. 
       const rankText = rankRes.content.find(b => b.type === 'text')?.text ?? '';
       const rankMatch = rankText.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
       if (rankMatch) {
-        try {
-          const parsed = JSON.parse(rankMatch[0]);
-          allRanked.push(...(parsed.ranked ?? []));
-        } catch (e) { console.error(`[job:${jobId}] Rank parse error batch ${i}:`, e.message); }
+        const parsed = safeParse(rankMatch[0]);
+        if (parsed?.ranked?.length) {
+          allRanked.push(...parsed.ranked);
+        } else {
+          console.error(`[job:${jobId}] Rank parse failed for batch at index ${i}, attempting per-candidate recovery`);
+          // Attempt to recover individual candidate objects from the malformed JSON
+          const objMatches = rankMatch[0].matchAll(/\{"index"\s*:\s*(\d+)[^}]*\}/g);
+          for (const m of objMatches) {
+            const obj = safeParse(m[0]);
+            if (obj?.index !== undefined && obj?.score !== undefined) allRanked.push(obj);
+          }
+        }
       }
     }
 
