@@ -7,22 +7,22 @@ import express from 'express';
 import https from 'https';
 
 // ── Env ───────────────────────────────────────────────────────────────────────
-const ANTHROPIC_API_KEY      = process.env.ANTHROPIC_API_KEY;
-const SLACK_BOT_TOKEN        = process.env.SLACK_BOT_TOKEN;
-const SLACK_APP_TOKEN        = process.env.SLACK_APP_TOKEN;
-const SLACK_SIGNING_SECRET   = process.env.SLACK_SIGNING_SECRET;
-const METAVIEW_API_KEY       = process.env.METAVIEW_API_KEY;
-const RANKING_PASSWORD       = process.env.RANKING_PASSWORD;
+const ANTHROPIC_API_KEY        = process.env.ANTHROPIC_API_KEY;
+const SLACK_BOT_TOKEN          = process.env.SLACK_BOT_TOKEN;
+const SLACK_APP_TOKEN          = process.env.SLACK_APP_TOKEN;
+const SLACK_SIGNING_SECRET     = process.env.SLACK_SIGNING_SECRET;
+const METAVIEW_API_KEY         = process.env.METAVIEW_API_KEY;
+const RANKING_PASSWORD         = process.env.RANKING_PASSWORD;
 const UPSTASH_REDIS_REST_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-const PUBLIC_URL             = process.env.PUBLIC_URL || 'https://candibot-production.up.railway.app';
-const PORT                   = process.env.PORT || 8080;
+const PUBLIC_URL               = process.env.PUBLIC_URL || 'https://candibot-production.up.railway.app';
+const PORT                     = process.env.PORT || 8080;
 
 // ── Clients ───────────────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
 
-// ── Retry wrapper ────────────────────────────────────────────────────────────
+// ── Retry wrapper ─────────────────────────────────────────────────────────────
 async function withRetry(fn, maxAttempts = 3) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -42,10 +42,17 @@ async function withRetry(fn, maxAttempts = 3) {
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const REPORT_ID = '61729db2-3946-11f1-b952-fb44be0b5cdb';
-const RANKING_TTL  = 30 * 24 * 60 * 60; // 30 days in seconds
-const SESSION_TTL  = 60 * 60;            // 1 hour in seconds
-const MCP_SERVERS  = [{ type: 'url', url: 'https://mcp.metaview.ai/mcp', name: 'metaview', authorization_token: METAVIEW_API_KEY }];
+const REPORT_ID   = '61729db2-3946-11f1-b952-fb44be0b5cdb';
+const RANKING_TTL = 30 * 24 * 60 * 60; // 30 days
+const SESSION_TTL = 60 * 60;            // 1 hour
+const JOB_TTL     = 24 * 60 * 60;       // 1 day (in-progress jobs)
+const MCP_SERVERS = [{ type: 'url', url: 'https://mcp.metaview.ai/mcp', name: 'metaview', authorization_token: METAVIEW_API_KEY }];
+
+const PRIMARY_FUNCTIONS = [
+  'Sales', 'Marketing', 'Product', 'Engineering', 'Design',
+  'People / HR', 'Finance', 'Operations', 'Customer Success',
+  'Legal', 'Data / Analytics', 'General Management',
+];
 
 const FIELD_IDS = [
   'default:candidate',
@@ -59,10 +66,17 @@ const FIELD_IDS = [
   'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9', // Deal Size
   'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915', // Tech Fluency
   'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de', // Location
+  'AI:b04c164c-49be-11f1-9b23-674021cd80ae', // Primary Function
+  'AI:b76395ae-49be-11f1-b7cc-27718543b130', // Cross-Functional
+  'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042', // Comp Context
+  'AI:e07de6f6-49be-11f1-a6c6-2f3b4b019285', // Availability
+  'AI:07343c46-49bf-11f1-ac1a-dbf22856edfb', // Reason for Looking
+  'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2', // Comp Expectations
+  'default:start_time',
+  'default:interviewer',
 ];
 
 // ── Session management ────────────────────────────────────────────────────────
-// Stores per-user context: active search, last candidate discussed, etc.
 async function getSession(userId) {
   try {
     const raw = await redis.get(`session:${userId}`);
@@ -94,17 +108,30 @@ async function getRanking(id) {
   return typeof raw === 'string' ? JSON.parse(raw) : raw;
 }
 
+// ── Ranking job management ────────────────────────────────────────────────────
+// Jobs are stored separately from final rankings.
+// Status: pending | running | done | error
+async function setJob(jobId, data) {
+  await redis.set(`job:${jobId}`, JSON.stringify(data), { ex: JOB_TTL });
+}
+
+async function getJob(jobId) {
+  const raw = await redis.get(`job:${jobId}`);
+  if (!raw) return null;
+  return typeof raw === 'string' ? JSON.parse(raw) : raw;
+}
+
 // ── Intent detection ──────────────────────────────────────────────────────────
 const INTENTS = {
-  RANK:       'rank',       // "rank candidates for this VP Sales role"
-  FIND:       'find',       // "find me engineers with fintech background"
-  LOOKUP:     'lookup',     // "pull up John Smith" / "tell me about Sarah Lee"
-  FOLLOWUP:   'followup',   // "what was their comp?" / "tell me more about their GTM experience"
-  SUMMARIZE:  'summarize',  // "summarize the last 5 sales calls"
-  HELP:       'help',       // "help" / "what can you do"
-  RESET:      'reset',      // "start over" / "reset"
-  DEEPER:     'deeper',     // "search deeper" / "look further back"
-  UNKNOWN:    'unknown',
+  RANK:      'rank',
+  FIND:      'find',
+  LOOKUP:    'lookup',
+  FOLLOWUP:  'followup',
+  SUMMARIZE: 'summarize',
+  HELP:      'help',
+  RESET:     'reset',
+  DEEPER:    'deeper',
+  UNKNOWN:   'unknown',
 };
 
 async function detectIntent(message, session) {
@@ -117,22 +144,23 @@ Intents:
 - rank: user wants to rank/score candidates against a role or JD
 - find: user wants to search for candidates matching criteria
 - lookup: user wants info on a specific named candidate
-- followup: user is asking a follow-up question about the last candidate discussed (e.g. "what was their comp?", "what about their GTM experience?", "how much were they making?", "did they discuss availability?") — use this when there's a candidate in session context and no new name is mentioned
+- followup: user is asking a follow-up question about the last candidate discussed (e.g. "what was their comp?", "what about their GTM experience?") — use this when there's a candidate in session context and no new name is mentioned
 - summarize: user wants a summary of conversations or a candidate
 - help: user wants to know what the bot can do
 - reset: user wants to clear context and start fresh
-- deeper: user wants to search further back in the candidate database after a find query (e.g. "search deeper", "look further back", "check older candidates")
+- deeper: user wants to search further back in the candidate database after a find query
 - unknown: none of the above
 
 Entities to extract:
 - name: candidate name if mentioned
 - role: job title or function if mentioned
+- company: company name if mentioned (for rank intent)
 - criteria: any search criteria mentioned
 - jd: job description text if pasted (long text)
 
 Current session context: ${JSON.stringify(session)}
 
-Return format: {"intent": "rank", "entities": {"role": "VP Sales", "jd": null}}`,
+Return format: {"intent": "rank", "entities": {"role": "VP Sales", "company": "Arlo", "jd": null}}`,
     messages: [{ role: 'user', content: message }]
   });
 
@@ -150,7 +178,6 @@ function getVal(conv, fieldId) {
   return labels.length ? labels.join(', ') : null;
 }
 
-// Run a single Metaview MCP call via Claude and extract the tool result
 async function metaviewCall(toolName, params) {
   const final = await withRetry(async () => {
     const stream = anthropic.beta.messages.stream(
@@ -165,6 +192,7 @@ async function metaviewCall(toolName, params) {
     );
     return stream.finalMessage();
   });
+
   const mcpResults = final.content.filter(b => b.type === 'mcp_tool_result');
   const textBlocks = final.content.filter(b => b.type === 'text');
 
@@ -179,7 +207,6 @@ async function metaviewCall(toolName, params) {
   return null;
 }
 
-// Fetch all candidates matching filters, paginating server-side
 async function fetchCandidates(filters, maxPages = Infinity) {
   let all = [], offset = 0, hasMore = true, page = 0;
 
@@ -206,45 +233,334 @@ async function fetchCandidates(filters, maxPages = Infinity) {
     hasMore = result.has_more ?? false;
     offset += result.conversations.length;
     console.log(`Page ${page}: +${result.conversations.length}, total: ${all.length}, has_more: ${hasMore}`);
-
-    // No delay for sourcing queries — speed matters more than rate limit caution here
   }
 
   return all;
 }
 
+// ── Ranking job runner (runs fully server-side, no browser needed) ─────────────
+async function runRankingJob(jobId, jd, role, company, slackUserId, slackSay) {
+  console.log(`[job:${jobId}] Starting ranking job — role: ${role}, company: ${company}`);
+
+  try {
+    // Update status to running
+    await setJob(jobId, { status: 'running', role, company, startedAt: Date.now(), progress: 'Inferring primary function…' });
+
+    // Stage 1: infer primary function
+    const inferRes = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 100,
+      system: 'You map job descriptions to exactly one primary function from a fixed list based on the PRIMARY role being hired. A VP of Sales is Sales. A CMO is Marketing. A CTO is Engineering. Return ONLY the exact function name from the list, nothing else — no explanation, no punctuation.',
+      messages: [{ role: 'user', content: 'List:\n' + PRIMARY_FUNCTIONS.join('\n') + '\n\nWhat is the primary function of the role described below? Return only the function name.\n\n' + jd.slice(0, 2000) }]
+    });
+    const inferRaw = inferRes.content.find(b => b.type === 'text')?.text?.trim() ?? '';
+    const primaryFunction = PRIMARY_FUNCTIONS.find(f => inferRaw.toLowerCase().includes(f.toLowerCase())) ?? null;
+    console.log(`[job:${jobId}] Inferred function: ${primaryFunction}`);
+
+    // Stage 2: fetch candidates with function filter
+    await setJob(jobId, { status: 'running', role, company, startedAt: Date.now(), progress: `Fetching ${primaryFunction ?? 'all'} candidates…` });
+
+    const filters = [
+      { field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }
+    ];
+    if (primaryFunction) {
+      filters.push({ field_id: 'AI:b04c164c-49be-11f1-9b23-674021cd80ae', operation: 'is_one_of', value: [primaryFunction] });
+    }
+
+    const candidates = await fetchCandidates(filters);
+    console.log(`[job:${jobId}] Fetched ${candidates.length} candidates`);
+
+    if (!candidates.length) {
+      await setJob(jobId, { status: 'error', error: 'No candidates found for this function.' });
+      if (slackSay) await slackSay(`❌ Ranking job *${role}${company ? ' at ' + company : ''}* found no candidates. Try a different JD or criteria.`);
+      return;
+    }
+
+    // Stage 3: lightweight screen
+    await setJob(jobId, { status: 'running', role, company, startedAt: Date.now(), progress: `Screening ${candidates.length} candidates…` });
+
+    const slim = candidates.map((c, i) => ({
+      i,
+      name:          getVal(c, 'default:candidate') ?? `Candidate ${i + 1}`,
+      functionLevel: getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
+      seniority:     getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+      companyStage:  getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+      playerCoach:   getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
+      gtm:           getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+    }));
+
+    const SCREEN_CHUNK = 200;
+    const keepIndices = new Set();
+
+    for (let i = 0; i < slim.length; i += SCREEN_CHUNK) {
+      if (i > 0) await new Promise(r => setTimeout(r, 1000));
+      const chunk = slim.slice(i, i + SCREEN_CHUNK);
+      const screenRes = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1000,
+        system: 'You are a recruiting screener. Return ONLY a JSON object {"keep":[...indices...]} of candidates worth deeper evaluation. Be inclusive — exclude only obvious mismatches (wrong seniority level, irrelevant stage). No other text.',
+        messages: [{ role: 'user', content: `JD:\n${jd.slice(0, 1500)}\n\nCANDIDATES:\n${JSON.stringify(chunk)}` }]
+      });
+      const screenText = screenRes.content.find(b => b.type === 'text')?.text ?? '';
+      const screenMatch = screenText.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
+      if (screenMatch) {
+        try {
+          const parsed = JSON.parse(screenMatch[0]);
+          (parsed.keep ?? []).forEach(localIdx => keepIndices.add(i + localIdx));
+        } catch {}
+      }
+    }
+
+    const screened = keepIndices.size > 0 ? candidates.filter((_, i) => keepIndices.has(i)) : candidates;
+    console.log(`[job:${jobId}] Screened to ${screened.length} candidates`);
+
+    // Stage 4: full ranking
+    await setJob(jobId, { status: 'running', role, company, startedAt: Date.now(), progress: `Ranking ${screened.length} candidates…` });
+
+    const profiles = screened.map((c, i) => ({
+      index: i,
+      name:             getVal(c, 'default:candidate') ?? `Candidate ${i + 1}`,
+      url:              c.url,
+      functionLevel:    getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
+      seniority:        getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+      playerCoach:      getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
+      leadershipScope:  getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
+      gtm:              getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+      companyStage:     getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+      crossFunctional:  getVal(c, 'AI:b76395ae-49be-11f1-b7cc-27718543b130'),
+      compContext:      getVal(c, 'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042'),
+      compExpectations: getVal(c, 'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2'),
+      availability:     getVal(c, 'AI:e07de6f6-49be-11f1-a6c6-2f3b4b019285'),
+      dealSize:         getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
+      techFluency:      getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+      industry:         getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
+      reasonForLooking: getVal(c, 'AI:07343c46-49bf-11f1-ac1a-dbf22856edfb'),
+      location:         getVal(c, 'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de'),
+      date:             getVal(c, 'default:start_time'),
+      interviewer:      getVal(c, 'default:interviewer'),
+    }));
+
+    const CHUNK = 80;
+    const allRanked = [];
+
+    for (let i = 0; i < profiles.length; i += CHUNK) {
+      if (i > 0) await new Promise(r => setTimeout(r, 1500));
+      const chunk = profiles.slice(i, i + CHUNK);
+      const rankRes = await withRetry(() => anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4000,
+        system: `You are an expert executive recruiter at SwingSearch, a retained search firm for venture-backed tech startups.
+Rank every candidate by fit against the job description. Return ONLY valid JSON — no markdown, no backticks.
+
+Output:
+{"ranked":[{"index":<original index>,"score":<0-100>,"tier":"Strong Fit"|"Possible Fit"|"Not a Fit","headline":"<one sharp sentence>","strengths":["<s1>","<s2>","<s3>"],"gaps":["<g1>","<g2>"],"note":"<one nuanced observation>"}]}
+
+Scoring: 80-100 Strong Fit, 50-79 Possible Fit, 0-49 Not a Fit. Be opinionated. Include all candidates.`,
+        messages: [{ role: 'user', content: `JD/SCORECARD:\n${jd}\n\nCANDIDATES:\n${JSON.stringify(chunk, null, 2)}` }]
+      }));
+
+      const rankText = rankRes.content.find(b => b.type === 'text')?.text ?? '';
+      const rankMatch = rankText.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
+      if (rankMatch) {
+        try {
+          const parsed = JSON.parse(rankMatch[0]);
+          allRanked.push(...(parsed.ranked ?? []));
+        } catch (e) { console.error(`[job:${jobId}] Rank parse error batch ${i}:`, e.message); }
+      }
+    }
+
+    // Merge scores back with full profiles
+    const ranked = allRanked.map(r => {
+      const c = screened[r.index];
+      return {
+        ...r,
+        name:             getVal(c, 'default:candidate') ?? `Candidate ${r.index + 1}`,
+        url:              c.url,
+        functionLevel:    getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
+        seniority:        getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+        playerCoach:      getVal(c, 'AI:c3997064-49be-11f1-88cd-e34aef2bf193'),
+        leadershipScope:  getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
+        gtm:              getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+        companyStage:     getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+        crossFunctional:  getVal(c, 'AI:b76395ae-49be-11f1-b7cc-27718543b130'),
+        compContext:      getVal(c, 'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042'),
+        compExpectations: getVal(c, 'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2'),
+        availability:     getVal(c, 'AI:e07de6f6-49be-11f1-a6c6-2f3b4b019285'),
+        dealSize:         getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
+        techFluency:      getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+        industry:         getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
+        reasonForLooking: getVal(c, 'AI:07343c46-49bf-11f1-ac1a-dbf22856edfb'),
+        location:         getVal(c, 'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de'),
+        date:             getVal(c, 'default:start_time'),
+        interviewer:      getVal(c, 'default:interviewer'),
+      };
+    }).sort((a, b) => b.score - a.score);
+
+    // Save final ranking
+    const rankingId = crypto.randomBytes(8).toString('hex');
+    const jdSnippet = jd.length > 100 ? jd.slice(0, 100) + '…' : jd;
+    await saveRanking(rankingId, { jdSnippet, role, company, createdAt: new Date().toISOString(), ranked });
+
+    const rankingUrl = `${PUBLIC_URL}/ranking/${rankingId}`;
+    await setJob(jobId, { status: 'done', rankingUrl, rankingId });
+
+    console.log(`[job:${jobId}] Done — ${ranked.length} candidates ranked. URL: ${rankingUrl}`);
+
+    // Post results back to Slack
+    if (slackSay) {
+      const strong   = ranked.filter(r => r.tier === 'Strong Fit');
+      const possible = ranked.filter(r => r.tier === 'Possible Fit');
+      const notFit   = ranked.filter(r => r.tier === 'Not a Fit');
+
+      const topStrong = strong.slice(0, 3).map((r, i) =>
+        `${i + 1}. *${r.url ? `<${r.url}|${r.name}>` : r.name}* (${r.score}) — ${r.headline}`
+      ).join('\n');
+
+      await slackSay({
+        text: `✅ Ranking complete for ${role}${company ? ' at ' + company : ''}`,
+        blocks: [
+          {
+            type: 'header',
+            text: { type: 'plain_text', text: `📊 Ranking complete${company ? ': ' + company : ''}`, emoji: true }
+          },
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `*${role}${company ? ' at ' + company : ''}*\n\n*${strong.length} Strong Fit  ·  ${possible.length} Possible Fit  ·  ${notFit.length} Not a Fit*\n_${ranked.length} candidates evaluated_`
+            }
+          },
+          ...(strong.length > 0 ? [
+            { type: 'divider' },
+            {
+              type: 'section',
+              text: { type: 'mrkdwn', text: `*Top Strong Fit candidates:*\n${topStrong}` }
+            }
+          ] : []),
+          { type: 'divider' },
+          {
+            type: 'section',
+            text: { type: 'mrkdwn', text: `<${rankingUrl}|*View full ranking →*>  _(password protected, expires in 30 days)_` }
+          }
+        ]
+      });
+    }
+
+  } catch (err) {
+    console.error(`[job:${jobId}] Error:`, err.message);
+    await setJob(jobId, { status: 'error', error: err.message });
+    if (slackSay) {
+      await slackSay(`❌ Ranking job failed: ${err.message}`);
+    }
+  }
+}
+
 // ── Intent handlers ───────────────────────────────────────────────────────────
 
-// RANK: confirm function/level then hand off to Claude artifact
-async function handleRank(say, userId, entities, session) {
-  const role = entities.role ?? session.activeRole;
-  const jd   = entities.jd;
+// RANK: confirm job name, then kick off server-side ranking job
+async function handleRank(say, userId, entities, session, rawMessage) {
+  const role    = entities.role ?? session.activeRole;
+  const company = entities.company ?? session.activeCompany;
+  const jd      = entities.jd ?? (rawMessage?.length > 100 ? rawMessage : null);
 
-  // If we have a JD pasted directly, save it to session and proceed
-  if (jd && jd.length > 100) {
-    await setSession(userId, { pendingJD: jd, pendingRole: role });
+  // Awaiting JD after confirmation
+  if (session.awaitingRankJD && session.pendingRankRole) {
+    const confirmedRole    = session.pendingRankRole;
+    const confirmedCompany = session.pendingRankCompany;
+    const confirmedJobName = session.pendingRankJobName;
+    const incomingJD       = rawMessage?.length > 100 ? rawMessage : null;
+
+    if (!incomingJD) {
+      await say('Paste the job description or scorecard and I\'ll kick off the ranking.');
+      return;
+    }
+
+    await setSession(userId, {
+      awaitingRankJD: false, pendingRankRole: null,
+      pendingRankCompany: null, pendingRankJobName: null
+    });
+
+    const jobId = crypto.randomBytes(6).toString('hex');
+    await setJob(jobId, { status: 'pending', role: confirmedRole, company: confirmedCompany, jobName: confirmedJobName, createdAt: Date.now() });
+
     await say({
-      text: `Got it. Before I open the ranker, let me confirm the search criteria.`,
+      text: `Starting ranking job for ${confirmedRole}${confirmedCompany ? ' at ' + confirmedCompany : ''}…`,
       blocks: [
         {
           type: 'section',
-          text: { type: 'mrkdwn', text: `📋 *Ranking request received*\n\nI'll open the SwingSearch Candidate Ranker for you. Paste the same JD there to run the full ranking — it's faster and handles the full candidate pool.\n\n*<https://claude.ai|Open Claude →>* then find the Candidate Ranker conversation.\n\nOnce the ranking is complete the results will be saved and I'll post the link here.` }
+          text: {
+            type: 'mrkdwn',
+            text: `🔄 *Ranking started* — _${confirmedJobName}_\n\nFetching and scoring candidates now. This runs fully in the background — I'll post results here when it's done.\n\n_Typically takes 5–15 minutes depending on pipeline size._`
+          }
         }
       ]
     });
+
+    // Fire and forget — runs in background, posts results when done
+    runRankingJob(jobId, incomingJD, confirmedRole, confirmedCompany, userId, say).catch(e => {
+      console.error('Background ranking error:', e.message);
+    });
+
     return;
   }
 
-  // If no JD yet, ask for it
-  if (!role && !jd) {
-    await say("What role are you ranking candidates for? You can paste a job description or just describe the key criteria.");
+  // Awaiting confirmation of job name
+  if (session.awaitingRankConfirm && session.pendingRankRole) {
+    // User replied — treat their reply as confirmation or correction
+    const isConfirmed = /^(yes|yeah|yep|confirm|looks good|correct|ok|okay|go|go ahead|start|run it|do it)/i.test(rawMessage?.trim() ?? '');
+
+    if (!isConfirmed) {
+      // Treat their message as a corrected job name
+      await setSession(userId, {
+        awaitingRankConfirm: false,
+        awaitingRankJD: true,
+        pendingRankJobName: rawMessage?.trim(),
+      });
+      await say(`Got it — job name set to *${rawMessage?.trim()}*. Now paste the job description or scorecard.`);
+      return;
+    }
+
+    await setSession(userId, { awaitingRankConfirm: false, awaitingRankJD: true });
+    await say(`Perfect. Paste the job description or scorecard and I\'ll kick off the ranking.`);
+    return;
+  }
+
+  // No role yet — ask
+  if (!role) {
+    await say("What role are you ranking candidates for?");
     await setSession(userId, { awaitingRankInput: true });
     return;
   }
 
-  // We have a role but no JD — confirm and ask for more detail
-  await say(`Got it — ranking for *${role}*. Paste the full job description or scorecard and I'll open the ranker for you.`);
-  await setSession(userId, { activeRole: role, awaitingRankInput: true });
+  // Have role — propose job name and ask for confirmation
+  const suggestedJobName = `${role}${company ? ' — ' + company : ''} — ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+
+  await setSession(userId, {
+    awaitingRankConfirm: true,
+    awaitingRankJD: false,
+    pendingRankRole: role,
+    pendingRankCompany: company ?? null,
+    pendingRankJobName: suggestedJobName,
+    activeRole: role,
+    activeCompany: company ?? null,
+  });
+
+  await say({
+    text: `I'll name this ranking job: ${suggestedJobName}`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `I'll name this ranking job:\n\n*${suggestedJobName}*\n\nDoes that work, or would you like a different name?`
+        }
+      },
+      {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: '_Reply "yes" to confirm or type a different name._' }]
+      }
+    ]
+  });
 }
 
 // LOOKUP: find and summarize a specific candidate
@@ -260,7 +576,6 @@ async function handleLookup(say, userId, entities, session) {
   await say(`_Looking up ${name} in Metaview..._`);
 
   try {
-    // Step 1: resolve name to participant UUID via list_field_values
     const fieldValues = await metaviewCall('list_field_values', {
       field_id: 'default:candidate',
       report_id: REPORT_ID,
@@ -272,12 +587,10 @@ async function handleLookup(say, userId, entities, session) {
       return;
     }
 
-    // Use the first match — pick the closest name if multiple
     const match = fieldValues.values[0];
     const candidateUUID = match.value;
-    const resolvedName = match.label ?? name;
+    const resolvedName  = match.label ?? name;
 
-    // Step 2: fetch conversations for that candidate
     const result = await metaviewCall('search_conversations', {
       report_id: REPORT_ID,
       fields: [...FIELD_IDS, 'default:start_time', 'default:interviewer'],
@@ -293,8 +606,6 @@ async function handleLookup(say, userId, entities, session) {
     }
 
     const convs = result.conversations;
-
-    // Build a summary using Claude
     const profiles = convs.map(c => ({
       name:             getVal(c, 'default:candidate') ?? resolvedName,
       date:             c.fields?.['default:start_time']?.[0]?.label,
@@ -317,10 +628,7 @@ async function handleLookup(say, userId, entities, session) {
       url: c.url,
     }));
 
-    // Check if we have meaningful data to summarize
     const p = profiles[0];
-
-    // Save to session now that profiles is defined
     await setSession(userId, {
       lastCandidate: resolvedName,
       lastCandidateUUID: candidateUUID,
@@ -333,7 +641,6 @@ async function handleLookup(say, userId, entities, session) {
 
     let summary;
     if (!hasData) {
-      // Not enough AI field data — give a direct response without padding
       const interviewedBy = p.interviewer ? ` with ${p.interviewer}` : '';
       const interviewDate = p.date ? ` on ${p.date}` : '';
       summary = `Interviewed${interviewedBy}${interviewDate}. Profile fields haven't been analyzed yet — this is likely a recent interview. Review the full recording for details.`;
@@ -351,7 +658,6 @@ async function handleLookup(say, userId, entities, session) {
       { type: 'section', text: { type: 'mrkdwn', text: `*${profiles[0].name ?? name}*${profiles[0].functionLevel ? `  ·  ${profiles[0].functionLevel}` : ''}` } },
       { type: 'section', text: { type: 'mrkdwn', text: summary } },
     ];
-
     if (convs.length > 1) {
       blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_${convs.length} interviews on file. Showing most recent._` }] });
     }
@@ -359,8 +665,7 @@ async function handleLookup(say, userId, entities, session) {
     await say({ text: `Found ${resolvedName}`, blocks });
 
   } catch (err) {
-    console.error('Lookup error full:', err?.message ?? err);
-    console.error('Lookup error stack:', err?.stack);
+    console.error('Lookup error:', err?.message ?? err);
     if (err?.status === 429) {
       const retryAfter = parseInt(err.headers?.['retry-after'] ?? '60', 10);
       await say(`I'm hitting API rate limits. Try again in about ${Math.ceil(retryAfter / 60)} minute(s).`);
@@ -383,7 +688,6 @@ async function handleFind(say, userId, entities, session) {
   await say(`_Searching for ${criteria}..._`);
 
   try {
-    // Use Claude to translate criteria into Metaview filters
     const filterRes = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 400,
@@ -399,34 +703,32 @@ Example output: [{"field_id": "AI:b04c164c-49be-11f1-9b23-674021cd80ae", "operat
       messages: [{ role: 'user', content: criteria }]
     });
 
-    const filterText = filterRes.content.find(b => b.type === 'text')?.text ?? '';
+    const filterText  = filterRes.content.find(b => b.type === 'text')?.text ?? '';
     const filterMatch = filterText.match(/\[[\s\S]*\]/);
     if (!filterMatch) throw new Error('Could not parse filters from criteria');
     const filters = JSON.parse(filterMatch[0]);
 
-    const candidates = await fetchCandidates(filters, 10); // Cap at 500 candidates for sourcing
+    const candidates = await fetchCandidates(filters, 10);
 
     if (!candidates.length) {
       await say(`No candidates found matching "${criteria}" in the last 24 months.`);
       return;
     }
 
-    // Score and filter top matches using Claude
     const profiles = candidates.map((c, i) => ({
       index: i,
-      name: getVal(c, 'default:candidate') ?? `Candidate ${i+1}`,
-      url: c.url,
+      name:          getVal(c, 'default:candidate') ?? `Candidate ${i+1}`,
+      url:           c.url,
       functionLevel: getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
-      seniority: getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
+      seniority:     getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
       leadershipScope: getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
-      gtm: getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
-      companyStage: getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
-      industry: getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
-      dealSize: getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
-      techFluency: getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
+      gtm:           getVal(c, 'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e'),
+      companyStage:  getVal(c, 'AI:a9150424-49be-11f1-8e19-179706228ab0'),
+      industry:      getVal(c, 'AI:ffcd1fa4-49be-11f1-a302-239193bb599f'),
+      dealSize:      getVal(c, 'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9'),
+      techFluency:   getVal(c, 'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915'),
     }));
 
-    // Chunk if large
     const CHUNK = 80;
     let topMatches = [];
     for (let i = 0; i < profiles.length; i += CHUNK) {
@@ -451,7 +753,6 @@ Only include candidates with score >= 60. Maximum 8 candidates. Be selective and
       }
     }
 
-    // Sort and take top 8
     topMatches = topMatches.sort((a, b) => b.score - a.score).slice(0, 8);
 
     if (!topMatches.length) {
@@ -472,16 +773,12 @@ Only include candidates with score >= 60. Maximum 8 candidates. Be selective and
       if (!p) return;
       blocks.push({
         type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*${i+1}. ${p.url ? `<${p.url}|${p.name}>` : p.name}*${p.functionLevel ? `  ·  ${p.functionLevel}` : ''}\n${m.reason}`
-        }
+        text: { type: 'mrkdwn', text: `*${i+1}. ${p.url ? `<${p.url}|${p.name}>` : p.name}*${p.functionLevel ? `  ·  ${p.functionLevel}` : ''}\n${m.reason}` }
       });
       if (i < topMatches.length - 1) blocks.push({ type: 'divider' });
     });
 
     blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_Say "tell me more about [name]" for a deeper profile on any candidate._` }] });
-
     await say({ text: `Found ${topMatches.length} matches`, blocks });
 
   } catch (err) {
@@ -490,7 +787,7 @@ Only include candidates with score >= 60. Maximum 8 candidates. Be selective and
   }
 }
 
-// HELP: show capabilities
+// HELP
 async function handleHelp(say) {
   await say({
     text: 'Here\'s what I can do',
@@ -500,25 +797,23 @@ async function handleHelp(say) {
       { type: 'divider' },
       { type: 'section', text: { type: 'mrkdwn', text: '*👤 Look up a candidate*\nGet a quick profile on anyone we\'ve screened.\n_"Pull up Indy Sen"_ or _"Tell me about Sarah Lee"_' } },
       { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*📊 Rank your pipeline*\nScore candidates against a job description or scorecard. Paste the full JD or key criteria and I\'ll open the Claude ranker — results post back here as a shareable link.\n_"Rank candidates for VP Sales at AmberBox"_\n_"Here\'s the scorecard: [paste]"_' } },
+      { type: 'section', text: { type: 'mrkdwn', text: '*📊 Rank candidates*\nScore your full pipeline against a role or JD — runs fully in the background, results post here as a link.\n_"Rank candidates for the VP Sales role at AmberBox"_\nI\'ll confirm the job name, then ask for the JD.' } },
       { type: 'divider' },
       { type: 'context', elements: [{ type: 'mrkdwn', text: '_Say "reset" to clear context and start fresh._' }] },
     ]
   });
 }
 
-// ── Follow-up question handler ───────────────────────────────────────────────
+// FOLLOWUP
 async function handleFollowup(say, userId, message, session) {
   const profile = session.lastCandidateProfile;
-  const name = session.lastCandidate;
+  const name    = session.lastCandidate;
 
   if (!profile || !name) {
     await say("I don't have a candidate in context. Who would you like to know more about?");
     return;
   }
 
-  // Also pull comp expectations field which isn't in the main FIELD_IDS
-  // Fetch it fresh if asked about comp
   const isCompQuestion = /comp|salary|pay|compensation|making|earn|expectation/i.test(message);
   let compData = null;
 
@@ -526,11 +821,7 @@ async function handleFollowup(say, userId, message, session) {
     try {
       const compResult = await metaviewCall('search_conversations', {
         report_id: REPORT_ID,
-        fields: [
-          'default:candidate',
-          'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2', // Compensation Expectations
-          'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042', // Comp Context
-        ],
+        fields: ['default:candidate', 'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2', 'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042'],
         filters: [{ field_id: 'default:candidate', operation: 'includes_one_of', value: [profile.uuid ?? session.lastCandidateUUID] }],
         limit: 1,
         sort_by: 'default:start_time',
@@ -540,12 +831,10 @@ async function handleFollowup(say, userId, message, session) {
         const c = compResult.conversations[0];
         compData = {
           compExpectations: getVal(c, 'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2'),
-          compContext: getVal(c, 'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042'),
+          compContext:      getVal(c, 'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042'),
         };
       }
-    } catch (e) {
-      console.error('Comp fetch error:', e.message);
-    }
+    } catch (e) { console.error('Comp fetch error:', e.message); }
   }
 
   const profileWithComp = compData ? { ...profile, ...compData } : profile;
@@ -553,20 +842,15 @@ async function handleFollowup(say, userId, message, session) {
   const res = await withRetry(() => anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 300,
-    system: `You are a recruiter's assistant at SwingSearch. Answer the specific question asked about a candidate using only the data provided. Be direct and concise — 1-3 sentences. If the data doesn't contain the answer, say so plainly without padding. Never mention client or employer names.`,
-    messages: [{
-      role: 'user',
-      content: `Candidate profile: ${JSON.stringify(profileWithComp)}
-
-Question: ${message}`
-    }]
+    system: `You are a recruiter's assistant at SwingSearch. Answer the specific question asked about a candidate using only the data provided. Be direct and concise — 1-3 sentences. If the data doesn't contain the answer, say so plainly. Never mention client or employer names.`,
+    messages: [{ role: 'user', content: `Candidate profile: ${JSON.stringify(profileWithComp)}\n\nQuestion: ${message}` }]
   }));
 
   const answer = res.content.find(b => b.type === 'text')?.text ?? '';
   await say(answer);
 }
 
-// ── Deeper search handler ────────────────────────────────────────────────────
+// DEEPER
 async function handleDeeper(say, userId, session) {
   const criteria = session.lastSearch;
   if (!criteria) {
@@ -588,14 +872,13 @@ Always include the date filter.`,
       messages: [{ role: 'user', content: criteria }]
     });
 
-    const filterText = filterRes.content.find(b => b.type === 'text')?.text ?? '';
+    const filterText  = filterRes.content.find(b => b.type === 'text')?.text ?? '';
     const filterMatch = filterText.match(/\[[\s\S]*\]/);
     if (!filterMatch) throw new Error('Could not parse filters');
     const filters = JSON.parse(filterMatch[0]);
 
-    // Fetch pages 3-6 (candidates 101-300) — skipping what was already shown
-    const allCandidates = await fetchCandidates(filters, 20);
-    const deeperCandidates = allCandidates.slice(500); // Skip first 500 already shown
+    const allCandidates    = await fetchCandidates(filters, 20);
+    const deeperCandidates = allCandidates.slice(500);
 
     if (!deeperCandidates.length) {
       await say("No additional candidates found beyond what was already shown.");
@@ -604,8 +887,8 @@ Always include the date filter.`,
 
     const profiles = deeperCandidates.map((c, i) => ({
       index: i,
-      name: getVal(c, 'default:candidate') ?? `Candidate ${i+1}`,
-      url: c.url,
+      name:            getVal(c, 'default:candidate') ?? `Candidate ${i+1}`,
+      url:             c.url,
       functionLevel:   getVal(c, 'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e'),
       seniority:       getVal(c, 'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46'),
       leadershipScope: getVal(c, 'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d'),
@@ -623,22 +906,17 @@ Always include the date filter.`,
       system: `Find the top candidates matching search criteria from an older pool. Return ONLY valid JSON.
 Output: {"matches": [{"index": <n>, "score": <0-100>, "reason": "<one sentence>"}]}
 Only include candidates with score >= 60. Maximum 8 candidates.`,
-      messages: [{ role: 'user', content: `SEARCH: ${criteria}
-
-CANDIDATES: ${JSON.stringify(profiles.slice(0, 80), null, 2)}` }]
+      messages: [{ role: 'user', content: `SEARCH: ${criteria}\n\nCANDIDATES: ${JSON.stringify(profiles.slice(0, 80), null, 2)}` }]
     });
 
     const text = res.content.find(b => b.type === 'text')?.text ?? '';
     const match = text.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
     if (!match) { await say("No additional matches found in the deeper search."); return; }
 
-    const parsed = JSON.parse(match[0]);
+    const parsed     = JSON.parse(match[0]);
     const topMatches = (parsed.matches ?? []).sort((a, b) => b.score - a.score).slice(0, 8);
 
-    if (!topMatches.length) {
-      await say(`No additional matches found beyond the initial results.`);
-      return;
-    }
+    if (!topMatches.length) { await say("No additional matches found beyond the initial results."); return; }
 
     const blocks = [
       { type: 'header', text: { type: 'plain_text', text: `🔍 Deeper results: ${criteria.slice(0, 50)}`, emoji: true } },
@@ -649,11 +927,7 @@ CANDIDATES: ${JSON.stringify(profiles.slice(0, 80), null, 2)}` }]
     topMatches.forEach((m, i) => {
       const p = profiles[m.index];
       if (!p) return;
-      blocks.push({
-        type: 'section',
-        text: { type: 'mrkdwn', text: `*${i+1}. ${p.url ? `<${p.url}|${p.name}>` : p.name}*${p.functionLevel ? `  ·  ${p.functionLevel}` : ''}
-${m.reason}` }
-      });
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*${i+1}. ${p.url ? `<${p.url}|${p.name}>` : p.name}*${p.functionLevel ? `  ·  ${p.functionLevel}` : ''}\n${m.reason}` } });
       if (i < topMatches.length - 1) blocks.push({ type: 'divider' });
     });
 
@@ -667,14 +941,16 @@ ${m.reason}` }
 
 // ── Main message router ───────────────────────────────────────────────────────
 async function routeMessage(say, userId, text) {
-  // Load session
   const session = await getSession(userId);
-
-  // Detect intent
   const { intent, entities } = await detectIntent(text, session);
   console.log(`User ${userId} intent: ${intent}`, entities);
 
-  // Route to handler
+  // Handle pending rank confirmation/JD states before normal routing
+  if (session.awaitingRankConfirm || session.awaitingRankJD) {
+    await handleRank(say, userId, entities, session, text);
+    return;
+  }
+
   switch (intent) {
     case INTENTS.DEEPER:
       await handleDeeper(say, userId, session);
@@ -683,7 +959,7 @@ async function routeMessage(say, userId, text) {
       await handleFollowup(say, userId, text, session);
       break;
     case INTENTS.RANK:
-      await handleRank(say, userId, entities, session);
+      await handleRank(say, userId, entities, session, text);
       break;
     case INTENTS.LOOKUP:
     case INTENTS.SUMMARIZE:
@@ -700,10 +976,9 @@ async function routeMessage(say, userId, text) {
       await handleHelp(say);
       break;
     default:
-      // Check if we're awaiting specific input from a previous turn
       if (session.awaitingRankInput) {
         await setSession(userId, { awaitingRankInput: false });
-        await handleRank(say, userId, { ...entities, jd: text.length > 100 ? text : null, role: entities.role ?? text }, session);
+        await handleRank(say, userId, { ...entities, role: entities.role ?? text }, session, text);
       } else if (session.awaitingName) {
         await setSession(userId, { awaitingName: false });
         await handleLookup(say, userId, { name: text }, session);
@@ -724,13 +999,10 @@ const slackApp = new App({
   socketMode: true,
 });
 
-// Handle all DMs
 slackApp.message(async ({ message, say }) => {
   if (message.bot_id || message.subtype) return;
   const text = message.text?.trim();
   if (!text) return;
-
-  // Acknowledge immediately, then process
   try {
     await routeMessage(say, message.user, text);
   } catch (err) {
@@ -744,19 +1016,15 @@ slackApp.message(async ({ message, say }) => {
   }
 });
 
-// /help slash command
 slackApp.command('/candibot-help', async ({ ack, say }) => {
   await ack();
   await handleHelp(say);
 });
 
-// ── Hosted ranking page (Express, separate port) ──────────────────────────────
-// Railway exposes one public port — we use the same process but a separate
-// internal HTTP server for serving hosted ranking pages.
+// ── Express ───────────────────────────────────────────────────────────────────
 const expressApp = express();
 expressApp.use(express.json());
 
-// ── CORS ── allow Claude.ai artifact to call these endpoints ──────────────────
 expressApp.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -765,63 +1033,18 @@ expressApp.use((req, res, next) => {
   next();
 });
 
-// ── Metaview token endpoint — used by Claude artifact ────────────────────────
-expressApp.get('/metaview-token', (req, res) => {
-  res.json({ token: METAVIEW_API_KEY });
-});
-
-// ── Metaview proxy: fetch candidates page (no Claude API call) ────────────────
-expressApp.post('/fetch-candidates', async (req, res) => {
+// Job status polling — artifact calls this to check if ranking is done
+expressApp.get('/job/:jobId', async (req, res) => {
   try {
-    const { filters = [], offset = 0, limit = 50 } = req.body;
-    const payload = JSON.stringify({
-      report_id: REPORT_ID,
-      fields: FIELD_IDS,
-      filters: [
-        ...filters,
-        { field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }
-      ],
-      limit,
-      offset,
-      sort_by: 'default:start_time',
-      sort_ascending: false
-    });
-
-    const result = await new Promise((resolve, reject) => {
-      const r = https.request(
-        {
-          hostname: 'api.metaview.ai',
-          path: '/v1/conversations/search',
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(payload),
-            'Authorization': `Bearer ${METAVIEW_API_KEY}`,
-          }
-        },
-        (resp) => {
-          let buf = '';
-          resp.on('data', c => buf += c);
-          resp.on('end', () => {
-            try { resolve({ status: resp.statusCode, body: JSON.parse(buf) }); }
-            catch { resolve({ status: resp.statusCode, body: buf }); }
-          });
-        }
-      );
-      r.on('error', reject);
-      r.write(payload);
-      r.end();
-    });
-
-    console.log(`fetch-candidates: offset=${offset}, status=${result.status}, count=${result.body?.conversations?.length ?? 0}`);
-    res.status(result.status).json(result.body);
+    const job = await getJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    res.json(job);
   } catch (e) {
-    console.error('fetch-candidates error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── Metaview proxy: save ranking from artifact ────────────────────────────────
+// Ranking page
 expressApp.get('/ranking/:id', async (req, res) => {
   try {
     const data = await getRanking(req.params.id);
@@ -833,8 +1056,8 @@ expressApp.get('/ranking/:id', async (req, res) => {
   }
 });
 
-// Save ranking endpoint — called by the Claude artifact
-expressApp.post('/save-ranking', express.json(), async (req, res) => {
+// Save ranking — kept for backward compatibility with artifact
+expressApp.post('/save-ranking', async (req, res) => {
   try {
     const { ranked, jdSnippet } = req.body;
     if (!ranked?.length) return res.status(400).json({ error: 'No ranked candidates provided' });
@@ -842,7 +1065,6 @@ expressApp.post('/save-ranking', express.json(), async (req, res) => {
     await saveRanking(id, { jdSnippet, createdAt: new Date().toISOString(), ranked });
     res.json({ url: `${PUBLIC_URL}/ranking/${id}` });
   } catch (e) {
-    console.error('Save ranking error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -860,8 +1082,8 @@ function buildRankingHTML(rankingData) {
   const tierBorder = { 'Strong Fit': 'rgba(27,122,74,0.25)', 'Possible Fit': 'rgba(200,150,30,0.25)' };
 
   function cardHTML(r, rank) {
-    const tc = tierColor[r.tier] ?? '#9B6C1A';
-    const tb = tierBg[r.tier] ?? 'rgba(200,150,30,0.08)';
+    const tc  = tierColor[r.tier]  ?? '#9B6C1A';
+    const tb  = tierBg[r.tier]    ?? 'rgba(200,150,30,0.08)';
     const tbd = tierBorder[r.tier] ?? 'rgba(200,150,30,0.25)';
     const strengths = (r.strengths ?? []).map(s => `<div class="bullet green">+ ${s}</div>`).join('');
     const gaps = (r.gaps ?? []).length
