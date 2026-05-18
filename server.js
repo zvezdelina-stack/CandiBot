@@ -63,18 +63,18 @@ function safeParse(raw) {
 // Create one saved report per function in Metaview (filtered by Primary Function),
 // then paste each report's UUID from the URL: app.metaview.ai/reports/<uuid>
 const REPORT_IDS = {
-  'Sales':              '112a923e-5308-11f1-92cb-73244d6b0d33',
-  'Marketing':          '16fba9c4-5302-11f1-a6d5-537df3062a22',
-  'Product':            'f1a6ec00-5307-11f1-9190-778a4330fa61',
-  'Engineering':        '0b1ffe08-5301-11f1-ba5a-8702f0ef4c78',
-  'Design':             'e8c223d6-5300-11f1-b327-970da0c4f185',
-  'People / HR':        '86735e8c-5307-11f1-851f-23286cd35cc4',
-  'Finance':            '5ca0c028-5301-11f1-99c8-dfea1ef56f68',
-  'Operations':         '2ffdbe58-5307-11f1-a502-c7feb36b30f2',
-  'Customer Success':   '0c9ef8ca-5085-11f1-8bac-ab512eacbb70',
-  'Legal':              'f6e342b4-5301-11f1-9d38-97ef855eada6',
-  'Data / Analytics':   '493c1c72-5300-11f1-98ed-ab1c6a3a00a6',
-  'General Management': '7fc1b4d6-5301-11f1-b0dc-37ad7c65ac80',
+  'Sales':              'PASTE_SALES_REPORT_ID',
+  'Marketing':          'PASTE_MARKETING_REPORT_ID',
+  'Product':            'PASTE_PRODUCT_REPORT_ID',
+  'Engineering':        'PASTE_ENGINEERING_REPORT_ID',
+  'Design':             'PASTE_DESIGN_REPORT_ID',
+  'People / HR':        'PASTE_PEOPLE_HR_REPORT_ID',
+  'Finance':            'PASTE_FINANCE_REPORT_ID',
+  'Operations':         'PASTE_OPERATIONS_REPORT_ID',
+  'Customer Success':   'PASTE_CUSTOMER_SUCCESS_REPORT_ID',
+  'Legal':              'PASTE_LEGAL_REPORT_ID',
+  'Data / Analytics':   'PASTE_DATA_ANALYTICS_REPORT_ID',
+  'General Management': 'PASTE_GENERAL_MANAGEMENT_REPORT_ID',
 };
 
 // Fallback to the full Candidate Interviews report if function not matched
@@ -243,7 +243,7 @@ async function metaviewCall(toolName, params) {
   return null;
 }
 
-async function fetchCandidates(filters, maxPages = 2, reportId = REPORT_ID_FALLBACK) {
+async function fetchCandidates(filters, maxPages = Infinity, reportId = REPORT_ID_FALLBACK) {
   let all = [], offset = 0, hasMore = true, page = 0;
 
   while (hasMore && page < maxPages) {
@@ -302,9 +302,12 @@ async function runRankingJob(jobId, jd, role, company, slackUserId, slackSay) {
       : REPORT_ID_FALLBACK;
     console.log(`[job:${jobId}] Using report: ${reportId} (${primaryFunction ?? 'fallback'})`);
 
-    const filters = [
-      { field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }
-    ];
+    // No extra filters needed — the per-function report already scopes the candidate pool.
+    // Passing additional filters (e.g. date) can conflict with Metaview's report-level filters.
+    // Fall back to date filter only if using the fallback report.
+    const filters = reportId === REPORT_ID_FALLBACK
+      ? [{ field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }]
+      : [];
 
     const candidates = await fetchCandidates(filters, 2, reportId);
     console.log(`[job:${jobId}] Fetched ${candidates.length} candidates`);
