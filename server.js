@@ -408,10 +408,13 @@ async function handleHelp(say) {
       { type: 'header', text: { type: 'plain_text', text: 'CandiBot — What I can do', emoji: true } },
       { type: 'section', text: { type: 'mrkdwn', text: '*🔍 Find candidates*\nDescribe what you\'re looking for in plain English.\n_"Find me VP Sales candidates with enterprise SaaS experience"_' } },
       { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*👤 Look up a candidate*\nGet a quick profile on anyone we\'ve screened.\n_"Pull up Indy Sen"_ or _"Tell me about Sarah Lee"_' } },
+      { type: 'section', text: { type: 'mrkdwn', text: '*👤 Look up a candidate*\nGet a quick profile on anyone we\'ve screened.\n_"Pull up Kristie Chen"_ or _"Tell me about Sarah Lee"_' } },
       { type: 'divider' },
-
-      { type: 'context', elements: [{ type: 'mrkdwn', text: '_Say "reset" to clear context and start fresh._' }] },
+      { type: 'section', text: { type: 'mrkdwn', text: '*💬 Ask follow-up questions*\nDig into any candidate after looking them up.\n_"What was their comp?"_ or _"What\'s their availability?"_' } },
+      { type: 'divider' },
+      { type: 'section', text: { type: 'mrkdwn', text: '*🔎 Search deeper*\nExtend a find query further back in the database.\n_"Search deeper"_ after any find result' } },
+      { type: 'divider' },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: '_For pipeline ranking against a JD or scorecard, use the *Scorecard Ranking* skill in Claude. Say "reset" to clear context and start fresh._' }] },
     ]
   });
 }
