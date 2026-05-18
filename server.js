@@ -59,7 +59,26 @@ function safeParse(raw) {
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const REPORT_ID   = '61729db2-3946-11f1-b952-fb44be0b5cdb';
+// ── Metaview report IDs per function ─────────────────────────────────────────
+// Create one saved report per function in Metaview (filtered by Primary Function),
+// then paste each report's UUID from the URL: app.metaview.ai/reports/<uuid>
+const REPORT_IDS = {
+  'Sales':              '112a923e-5308-11f1-92cb-73244d6b0d33',
+  'Marketing':          '16fba9c4-5302-11f1-a6d5-537df3062a22',
+  'Product':            'f1a6ec00-5307-11f1-9190-778a4330fa61',
+  'Engineering':        '0b1ffe08-5301-11f1-ba5a-8702f0ef4c78',
+  'Design':             'e8c223d6-5300-11f1-b327-970da0c4f185',
+  'People / HR':        '86735e8c-5307-11f1-851f-23286cd35cc4',
+  'Finance':            '5ca0c028-5301-11f1-99c8-dfea1ef56f68',
+  'Operations':         '2ffdbe58-5307-11f1-a502-c7feb36b30f2',
+  'Customer Success':   '0c9ef8ca-5085-11f1-8bac-ab512eacbb70',
+  'Legal':              'f6e342b4-5301-11f1-9d38-97ef855eada6',
+  'Data / Analytics':   '493c1c72-5300-11f1-98ed-ab1c6a3a00a6',
+  'General Management': '7fc1b4d6-5301-11f1-b0dc-37ad7c65ac80',
+};
+
+// Fallback to the full Candidate Interviews report if function not matched
+const REPORT_ID_FALLBACK = '61729db2-3946-11f1-b952-fb44be0b5cdb';
 const RANKING_TTL = 30 * 24 * 60 * 60; // 30 days
 const SESSION_TTL = 60 * 60;            // 1 hour
 const JOB_TTL     = 24 * 60 * 60;       // 1 day (in-progress jobs)
@@ -224,7 +243,7 @@ async function metaviewCall(toolName, params) {
   return null;
 }
 
-async function fetchCandidates(filters, maxPages = Infinity) {
+async function fetchCandidates(filters, maxPages = Infinity, reportId = REPORT_ID_FALLBACK) {
   let all = [], offset = 0, hasMore = true, page = 0;
 
   while (hasMore && page < maxPages) {
@@ -232,7 +251,7 @@ async function fetchCandidates(filters, maxPages = Infinity) {
     console.log(`Fetching page ${page} (offset ${offset})...`);
 
     const result = await metaviewCall('search_conversations', {
-      report_id: REPORT_ID,
+      report_id: reportId,
       fields: FIELD_IDS,
       filters,
       limit: 50,
@@ -277,14 +296,17 @@ async function runRankingJob(jobId, jd, role, company, slackUserId, slackSay) {
     // Stage 2: fetch candidates with function filter
     await setJob(jobId, { status: 'running', role, company, startedAt: Date.now(), progress: `Fetching ${primaryFunction ?? 'all'} candidates…` });
 
+    // Pick the function-specific report — no filter needed, the report is the filter
+    const reportId = (primaryFunction && REPORT_IDS[primaryFunction] && !REPORT_IDS[primaryFunction].startsWith('PASTE'))
+      ? REPORT_IDS[primaryFunction]
+      : REPORT_ID_FALLBACK;
+    console.log(`[job:${jobId}] Using report: ${reportId} (${primaryFunction ?? 'fallback'})`);
+
     const filters = [
       { field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }
     ];
-    if (primaryFunction) {
-      filters.push({ field_id: 'AI:b04c164c-49be-11f1-9b23-674021cd80ae', operation: 'is_one_of', value: [primaryFunction] });
-    }
 
-    const candidates = await fetchCandidates(filters);
+    const candidates = await fetchCandidates(filters, Infinity, reportId);
     console.log(`[job:${jobId}] Fetched ${candidates.length} candidates`);
 
     if (!candidates.length) {
@@ -608,7 +630,7 @@ async function handleLookup(say, userId, entities, session) {
   try {
     const fieldValues = await metaviewCall('list_field_values', {
       field_id: 'default:candidate',
-      report_id: REPORT_ID,
+      report_id: reportId,
       search_term: name
     });
 
@@ -622,7 +644,7 @@ async function handleLookup(say, userId, entities, session) {
     const resolvedName  = match.label ?? name;
 
     const result = await metaviewCall('search_conversations', {
-      report_id: REPORT_ID,
+      report_id: reportId,
       fields: [...FIELD_IDS, 'default:start_time', 'default:interviewer'],
       filters: [{ field_id: 'default:candidate', operation: 'includes_one_of', value: [candidateUUID] }],
       limit: 5,
@@ -850,7 +872,7 @@ async function handleFollowup(say, userId, message, session) {
   if (isCompQuestion) {
     try {
       const compResult = await metaviewCall('search_conversations', {
-        report_id: REPORT_ID,
+        report_id: reportId,
         fields: ['default:candidate', 'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2', 'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042'],
         filters: [{ field_id: 'default:candidate', operation: 'includes_one_of', value: [profile.uuid ?? session.lastCandidateUUID] }],
         limit: 1,
