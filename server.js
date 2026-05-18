@@ -243,7 +243,7 @@ async function metaviewCall(toolName, params) {
   return null;
 }
 
-async function fetchCandidates(filters, maxPages = Infinity, reportId = REPORT_ID_FALLBACK) {
+async function fetchCandidates(filters, maxPages = 2, reportId = REPORT_ID_FALLBACK) {
   let all = [], offset = 0, hasMore = true, page = 0;
 
   while (hasMore && page < maxPages) {
@@ -306,7 +306,7 @@ async function runRankingJob(jobId, jd, role, company, slackUserId, slackSay) {
       { field_id: 'default:start_time', operation: 'after', value: { scope: 'relative', value: -63072000 } }
     ];
 
-    const candidates = await fetchCandidates(filters, Infinity, reportId);
+    const candidates = await fetchCandidates(filters, 2, reportId);
     console.log(`[job:${jobId}] Fetched ${candidates.length} candidates`);
 
     if (!candidates.length) {
