@@ -18,6 +18,33 @@ const PORT                     = process.env.PORT || 8080;
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
 
+// ── Config ────────────────────────────────────────────────────────────────────
+const REPORT_ID_FALLBACK = '61729db2-3946-11f1-b952-fb44be0b5cdb'; // Candidate Interviews (all functions)
+const SESSION_TTL        = 60 * 60;            // 1 hour
+const MCP_SERVERS        = [{ type: 'url', url: 'https://mcp.metaview.ai/mcp', name: 'metaview', authorization_token: METAVIEW_API_KEY }];
+
+const FIELD_IDS = [
+  'default:candidate',
+  'AI:e30fda36-49a1-11f1-8c8c-0be86f9f735e', // Function & Level
+  'AI:ce5f35c4-49be-11f1-b134-8386e8f8aa46', // Seniority
+  'AI:c3997064-49be-11f1-88cd-e34aef2bf193', // Player/Coach
+  'AI:917f01a2-49be-11f1-8173-9b81bcb7b69d', // Leadership Scope
+  'AI:9e23828e-49be-11f1-b88f-1b4a993d7d7e', // GTM
+  'AI:a9150424-49be-11f1-8e19-179706228ab0', // Company Stage
+  'AI:ffcd1fa4-49be-11f1-a302-239193bb599f', // Industry
+  'AI:ed14d7b2-49be-11f1-aa4c-c33869b423a9', // Deal Size
+  'AI:f8fd55a4-49be-11f1-a6b2-c3e5ce0f9915', // Tech Fluency
+  'AI:23a0a5ca-0844-11f1-a762-fff4ba5db7de', // Location
+  'AI:b04c164c-49be-11f1-9b23-674021cd80ae', // Primary Function
+  'AI:b76395ae-49be-11f1-b7cc-27718543b130', // Cross-Functional
+  'AI:da2d2f1e-49be-11f1-ad67-ef5324fa4042', // Comp Context
+  'AI:e07de6f6-49be-11f1-a6c6-2f3b4b019285', // Availability
+  'AI:07343c46-49bf-11f1-ac1a-dbf22856edfb', // Reason for Looking
+  'AI:ae6a2b14-0eed-11f0-8f5a-d3c7fd51bce2', // Comp Expectations
+  'default:start_time',
+  'default:interviewer',
+];
+
 // ── Retry wrapper ─────────────────────────────────────────────────────────────
 async function withRetry(fn, maxAttempts = 3) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -408,13 +435,10 @@ async function handleHelp(say) {
       { type: 'header', text: { type: 'plain_text', text: 'CandiBot — What I can do', emoji: true } },
       { type: 'section', text: { type: 'mrkdwn', text: '*🔍 Find candidates*\nDescribe what you\'re looking for in plain English.\n_"Find me VP Sales candidates with enterprise SaaS experience"_' } },
       { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*👤 Look up a candidate*\nGet a quick profile on anyone we\'ve screened.\n_"Pull up Kristie Chen"_ or _"Tell me about Sarah Lee"_' } },
+      { type: 'section', text: { type: 'mrkdwn', text: '*👤 Look up a candidate*\nGet a quick profile on anyone we\'ve screened.\n_"Pull up Indy Sen"_ or _"Tell me about Sarah Lee"_' } },
       { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*💬 Ask follow-up questions*\nDig into any candidate after looking them up.\n_"What was their comp?"_ or _"What\'s their availability?"_' } },
-      { type: 'divider' },
-      { type: 'section', text: { type: 'mrkdwn', text: '*🔎 Search deeper*\nExtend a find query further back in the database.\n_"Search deeper"_ after any find result' } },
-      { type: 'divider' },
-      { type: 'context', elements: [{ type: 'mrkdwn', text: '_For pipeline ranking against a JD or scorecard, use the *Scorecard Ranking* skill in Claude. Say "reset" to clear context and start fresh._' }] },
+
+      { type: 'context', elements: [{ type: 'mrkdwn', text: '_Say "reset" to clear context and start fresh._' }] },
     ]
   });
 }
